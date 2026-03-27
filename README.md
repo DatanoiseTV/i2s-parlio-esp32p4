@@ -188,6 +188,57 @@ int32_t frame[8] = { ch0, ch1, ch2, ch3, ch4, ch5, ch6, ch7 };
 parlio_adat_tx_write(adat, frame, 1, NULL, 1000);
 ```
 
+## Unified Multi-Protocol Output
+
+The unified driver (`parlio_audio_tx.h`) can output I2S, S/PDIF, and ADAT simultaneously on a single PARLIO TX unit. All protocols are encoded as parallel bit patterns in the same DMA buffer and shift out in lockstep.
+
+The PARLIO clock runs at the fastest protocol's rate (256 * Fs when ADAT is active). Slower protocols repeat their symbols to match. All outputs are sample-locked with zero inter-protocol skew.
+
+```c
+parlio_audio_i2s_config_t i2s_cfg = {
+    .mode = PARLIO_AUDIO_I2S_STANDARD,
+    .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 4,
+    .bclk_gpio = GPIO_NUM_22, .lrck_gpio = GPIO_NUM_23,
+    .data_gpios = { GPIO_NUM_24, GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27 },
+};
+parlio_audio_spdif_config_t spdif_cfg = {
+    .bits_per_sample = 24, .consumer_format = true,
+    .spdif_gpio = GPIO_NUM_28,
+};
+parlio_audio_adat_config_t adat_cfg = {
+    .adat_gpio = GPIO_NUM_29,
+};
+
+parlio_audio_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .mclk_gpio = GPIO_NUM_20,
+    .clk_out_gpio = GPIO_NUM_21,    /* outputs PARLIO clock as MCLK */
+    .i2s = &i2s_cfg,                /* 4 lines x 2 = 8 I2S channels */
+    .spdif = &spdif_cfg,            /* 2 S/PDIF channels */
+    .adat = &adat_cfg,              /* 8 ADAT channels */
+};
+
+parlio_audio_tx_handle_t tx;
+parlio_audio_tx_new(&cfg, &tx);
+parlio_audio_tx_enable(tx);
+
+/* Write all 18 channels per frame: [8x I2S, 2x SPDIF, 8x ADAT] */
+size_t frame_size = parlio_audio_tx_get_frame_size(tx); /* = 18 */
+int32_t samples[18] = { ... };
+parlio_audio_tx_write(tx, samples, 1, NULL, 1000);
+```
+
+### Resource usage per combination
+
+| Configuration | PARLIO clock | Data width | DMA/frame | Total channels |
+|---------------|-------------|------------|-----------|----------------|
+| I2S only (4 lines) | 64*Fs | 8-bit | 64 B | 8 |
+| ADAT only | 256*Fs | 1-bit | 32 B | 8 |
+| S/PDIF only | 128*Fs | 1-bit | 16 B | 2 |
+| I2S (4) + ADAT | 256*Fs | 8-bit | 256 B | 16 |
+| I2S (4) + SPDIF + ADAT | 256*Fs | 8-bit | 256 B | 18 |
+| I2S (12) + SPDIF + ADAT | 256*Fs | 16-bit | 512 B | 34 |
+
 ## Build
 
 ```bash
