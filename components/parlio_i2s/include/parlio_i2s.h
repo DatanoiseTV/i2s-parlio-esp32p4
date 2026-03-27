@@ -12,14 +12,21 @@ extern "C" {
 /*
  * PARLIO-based I2S/TDM transmitter for ESP32-P4.
  *
- * Uses the Parallel IO peripheral to synthesize I2S output signals (MCLK, BCLK,
- * LRCK/FSYNC, and a variable number of data lines). Clock is derived from the APLL
- * via the I2S peripheral's MCLK output, looped back as PARLIO external clock input.
+ * Uses the Parallel IO peripheral to synthesize I2S output signals clocked by
+ * the APLL. The I2S peripheral is used solely as a clock generator to produce
+ * MCLK from the APLL; that MCLK feeds into PARLIO as external clock, which
+ * divides it down to BCLK internally.
  *
- * Signal mapping on PARLIO data bus:
- *   bit 0 = BCLK
- *   bit 1 = LRCK / frame sync
- *   bit 2..N = audio data lines
+ * Signal routing:
+ *   APLL -> I2S MCLK pin -> PARLIO ext clock input (at MCLK rate)
+ *   PARLIO divides MCLK to BCLK internally
+ *   clk_out pin   = BCLK   (dedicated, not a data line)
+ *   TXD[0]        = LRCK / frame sync
+ *   TXD[1..N]     = audio data lines
+ *   I2S MCLK pin  = MCLK output (directly from APLL, directly usable by DAC)
+ *
+ * Because BCLK uses the dedicated clock output pin, all 15 remaining data
+ * lines (TXD[1..15]) are available for audio. TXD[0] is used for LRCK.
  *
  * Supported modes:
  *   STANDARD (I2S Philips) -- 2 slots per data line, 50/50 LRCK duty cycle
@@ -27,17 +34,15 @@ extern "C" {
  *   TDM8  -- 8 slots per data line, short frame sync pulse
  *   TDM16 -- 16 slots per data line, short frame sync pulse
  *
- * MCLK is output on the PARLIO clock output pin (directly mirrors the ext clock).
- *
- * Maximum channel counts (with 14 data lines):
- *   STANDARD: 14 x  2 =  28 channels
- *   TDM4:     14 x  4 =  56 channels
- *   TDM8:     14 x  8 = 112 channels
- *   TDM16:    14 x 16 = 224 channels
+ * Maximum channel counts (with 15 data lines):
+ *   STANDARD: 15 x  2 =  30 channels
+ *   TDM4:     15 x  4 =  60 channels
+ *   TDM8:     15 x  8 = 120 channels
+ *   TDM16:    15 x 16 = 240 channels
  */
 
-/* Maximum number of parallel data outputs. */
-#define PARLIO_I2S_MAX_DATA_LINES  14
+/* Maximum number of parallel audio data outputs (TXD[1..15]). */
+#define PARLIO_I2S_MAX_DATA_LINES  15
 
 /* Slot mode / protocol selection. The numeric value equals the slot count. */
 typedef enum {
@@ -59,11 +64,10 @@ typedef struct {
     parlio_i2s_mode_t mode;       /* STANDARD, TDM4, TDM8, or TDM16 (default: STANDARD) */
 
     /* GPIO assignments */
-    gpio_num_t mclk_gpio;         /* MCLK output pin */
-    gpio_num_t apll_feed_gpio;    /* GPIO used to route APLL clock into PARLIO (loopback) */
-    gpio_num_t bclk_gpio;         /* BCLK output (PARLIO data bit 0) */
-    gpio_num_t lrck_gpio;         /* LRCK / frame sync output (PARLIO data bit 1) */
-    gpio_num_t data_gpios[PARLIO_I2S_MAX_DATA_LINES]; /* audio data pins */
+    gpio_num_t mclk_gpio;         /* MCLK output (directly from I2S/APLL, also feeds PARLIO ext clk) */
+    gpio_num_t bclk_gpio;         /* BCLK output (PARLIO clk_out pin, dedicated) */
+    gpio_num_t lrck_gpio;         /* LRCK / frame sync output (PARLIO TXD[0]) */
+    gpio_num_t data_gpios[PARLIO_I2S_MAX_DATA_LINES]; /* audio data pins (PARLIO TXD[1..15]) */
 
     /* DMA / buffering */
     size_t dma_buffer_count;      /* number of DMA descriptors (default: 4) */
