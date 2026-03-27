@@ -73,6 +73,12 @@ struct parlio_audio_tx {
     spdif_state_t *spdif;
     adat_state_t  *adat;
 
+    /* Pre-computed per-tick lookup tables (eliminates divisions in hot path).
+     * Allocated once during init, ticks_per_frame entries each. */
+    uint16_t *tick_static_mask;  /* BCLK + LRCK bits for each tick (constant every frame) */
+    uint8_t  *tick_slot;         /* which slot (channel) this tick belongs to */
+    int8_t   *tick_bit_idx;      /* audio bit index within the slot (-1 = no data) */
+
     /* Sample layout */
     size_t samples_per_frame;
     size_t i2s_offset;
@@ -226,12 +232,65 @@ static void encode_adat_raw(adat_state_t *s, uint8_t *out,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Unified frame encoder                                              */
+/*  Pre-compute per-tick lookup tables (called once during init)        */
 /* ------------------------------------------------------------------ */
 
-static void encode_frame(struct parlio_audio_tx *h,
-                          uint8_t *dst,
-                          const int32_t *samples)
+static void build_tick_tables(struct parlio_audio_tx *h)
+{
+    const uint16_t tpf = h->ticks_per_frame;
+
+    h->tick_static_mask = calloc(tpf, sizeof(uint16_t));
+    h->tick_slot        = calloc(tpf, sizeof(uint8_t));
+    h->tick_bit_idx     = malloc(tpf * sizeof(int8_t));
+    if (!h->tick_static_mask || !h->tick_slot || !h->tick_bit_idx) return;
+
+    memset(h->tick_bit_idx, -1, tpf);
+
+    for (uint16_t tick = 0; tick < tpf; tick++) {
+        uint16_t mask = 0;
+        uint8_t slot = 0;
+        int8_t bit_idx = -1;
+
+        if (h->i2s) {
+            i2s_state_t *is = h->i2s;
+            uint16_t tpb = is->ticks_per_bclk;
+            uint16_t bclk_idx = tick / tpb;
+            uint16_t sub_tick = tick % tpb;
+
+            /* BCLK */
+            if (!is->bclk_on_clk_out) {
+                if (sub_tick < tpb / 2)
+                    mask |= (1 << is->bclk_bit);
+            }
+
+            /* LRCK */
+            slot = bclk_idx / is->slot_width;
+            if (is->mode == PARLIO_AUDIO_I2S_STANDARD) {
+                if (slot >= 1) mask |= (1 << is->lrck_bit);
+            } else {
+                if (bclk_idx == 0) mask |= (1 << is->lrck_bit);
+            }
+
+            /* Bit index */
+            uint16_t pos_in_slot = bclk_idx % is->slot_width;
+            int16_t bi = (int16_t)pos_in_slot - 1;
+            if (bi >= 0 && bi < is->bits_per_sample)
+                bit_idx = (int8_t)bi;
+        }
+
+        h->tick_static_mask[tick] = mask;
+        h->tick_slot[tick] = slot;
+        h->tick_bit_idx[tick] = bit_idx;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Unified frame encoder (hot path, uses pre-computed tables)          */
+/* ------------------------------------------------------------------ */
+
+static void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
+                                    uint8_t *dst,
+                                    const int32_t *samples)
 {
     const uint16_t tpf = h->ticks_per_frame;
     const uint8_t  pw  = h->parlio_width;
@@ -250,65 +309,50 @@ static void encode_frame(struct parlio_audio_tx *h,
         encode_adat_raw(h->adat, adat_bits, ap);
     }
 
-    /* I2S sample pointer */
-    const int32_t *i2s_samp = NULL;
-    if (h->i2s && samples) {
-        i2s_samp = samples + h->i2s_offset;
+    /* I2S sample pointer and state */
+    const int32_t *i2s_samp = (h->i2s && samples) ? samples + h->i2s_offset : NULL;
+    const uint16_t *static_mask = h->tick_static_mask;
+    const uint8_t  *slot_lut    = h->tick_slot;
+    const int8_t   *bidx_lut    = h->tick_bit_idx;
+
+    /* I2S state cache */
+    uint8_t i2s_ndl = 0, i2s_ns = 0, i2s_dsb = 0;
+    if (h->i2s) {
+        i2s_ndl = h->i2s->num_data_lines;
+        i2s_ns  = h->i2s->num_slots;
+        i2s_dsb = h->i2s->data_start_bit;
     }
 
-    /* Compose each PARLIO tick */
+    /* SPDIF/ADAT bit positions and tick ratios */
+    uint8_t spdif_dbit = h->spdif ? h->spdif->data_bit : 0;
+    uint16_t spdif_tpu = h->spdif ? h->spdif->ticks_per_ui : 1;
+    uint8_t adat_dbit  = h->adat ? h->adat->data_bit : 0;
+    uint16_t adat_tpb  = h->adat ? h->adat->ticks_per_bit : 1;
+
+    /* Compose each PARLIO tick using lookup tables (no divisions) */
     for (uint16_t tick = 0; tick < tpf; tick++) {
-        uint16_t word = 0;
+        uint16_t word = static_mask[tick]; /* BCLK + LRCK pre-computed */
 
-        /* --- I2S --- */
-        if (h->i2s) {
-            i2s_state_t *is = h->i2s;
-            uint16_t tpb = is->ticks_per_bclk;
-
-            uint16_t bclk_idx = tick / tpb;
-            uint16_t sub_tick = tick % tpb;
-
-            /* BCLK: high first half, low second half */
-            if (!is->bclk_on_clk_out) {
-                uint8_t bclk_val = (sub_tick < tpb / 2) ? 1 : 0;
-                word |= ((uint16_t)bclk_val << is->bclk_bit);
-            }
-
-            /* LRCK */
-            uint8_t slot = bclk_idx / is->slot_width;
-            uint8_t lrck;
-            if (is->mode == PARLIO_AUDIO_I2S_STANDARD) {
-                lrck = (slot >= 1) ? 1 : 0;
-            } else {
-                lrck = (bclk_idx == 0) ? 1 : 0;
-            }
-            word |= ((uint16_t)lrck << is->lrck_bit);
-
-            /* Data lines: MSB first, 1-BCLK Philips offset */
-            uint16_t pos_in_slot = bclk_idx % is->slot_width;
-            int16_t bit_idx = (int16_t)pos_in_slot - 1;
-
-            if (bit_idx >= 0 && bit_idx < is->bits_per_sample && i2s_samp) {
-                for (uint8_t line = 0; line < is->num_data_lines; line++) {
-                    int32_t samp = i2s_samp[line * is->num_slots + slot];
-                    uint8_t bv = (samp >> (31 - bit_idx)) & 1;
-                    word |= ((uint16_t)bv << (is->data_start_bit + line));
-                }
+        /* I2S data bits (only when bit_idx >= 0) */
+        int8_t bi = bidx_lut[tick];
+        if (bi >= 0 && i2s_samp) {
+            uint8_t sl = slot_lut[tick];
+            int shift = 31 - bi;
+            for (uint8_t line = 0; line < i2s_ndl; line++) {
+                word |= (uint16_t)(((uint32_t)i2s_samp[line * i2s_ns + sl] >> shift) & 1) << (i2s_dsb + line);
             }
         }
 
-        /* --- S/PDIF --- */
+        /* S/PDIF: read from pre-encoded bit buffer */
         if (h->spdif) {
-            uint16_t ui_idx = tick / h->spdif->ticks_per_ui;
-            uint8_t bv = (spdif_bits[ui_idx / 8] >> (ui_idx % 8)) & 1;
-            word |= ((uint16_t)bv << h->spdif->data_bit);
+            uint16_t ui = tick / spdif_tpu;
+            word |= (uint16_t)((spdif_bits[ui >> 3] >> (ui & 7)) & 1) << spdif_dbit;
         }
 
-        /* --- ADAT --- */
+        /* ADAT: read from pre-encoded bit buffer */
         if (h->adat) {
-            uint16_t bit_i = tick / h->adat->ticks_per_bit;
-            uint8_t bv = (adat_bits[bit_i / 8] >> (bit_i % 8)) & 1;
-            word |= ((uint16_t)bv << h->adat->data_bit);
+            uint16_t bi_a = tick / adat_tpb;
+            word |= (uint16_t)((adat_bits[bi_a >> 3] >> (bi_a & 7)) & 1) << adat_dbit;
         }
 
         write_parlio_word(dst, tick, word, pw);
@@ -503,6 +547,11 @@ esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
         offset += 8;
     }
     h->samples_per_frame = offset;
+
+    /* Build per-tick lookup tables (eliminates divisions in encode_frame) */
+    build_tick_tables(h);
+    ESP_GOTO_ON_FALSE(h->tick_static_mask && h->tick_bit_idx,
+                      ESP_ERR_NO_MEM, fail, TAG, "alloc tick tables");
 
     /* --- DMA buffers --- */
     h->frames_per_buf = config->frames_per_buffer ? config->frames_per_buffer : 64;
@@ -785,6 +834,9 @@ esp_err_t parlio_audio_tx_delete(parlio_audio_tx_handle_t handle)
         free(handle->dma_bufs);
     }
     if (handle->write_sem) vSemaphoreDelete(handle->write_sem);
+    free(handle->tick_static_mask);
+    free(handle->tick_slot);
+    free(handle->tick_bit_idx);
     free(handle->i2s);
     free(handle->spdif);
     free(handle->adat);
