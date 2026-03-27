@@ -1,0 +1,723 @@
+#include "parlio_audio_tx.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "driver/parlio_tx.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+static const char *TAG = "parlio_audio";
+
+/* ------------------------------------------------------------------ */
+/*  Internal sub-structures for each protocol                          */
+/* ------------------------------------------------------------------ */
+
+/* S/PDIF preamble tables (BMC-encoded, 8 UI each) */
+static const uint8_t SPDIF_PRE_B[2] = { 0xE8, 0x17 }; /* block start, left */
+static const uint8_t SPDIF_PRE_M[2] = { 0xE2, 0x1D }; /* left, not block start */
+static const uint8_t SPDIF_PRE_W[2] = { 0xE4, 0x1B }; /* right */
+
+/* Consumer channel status for 48 kHz, 24-bit, no copy protection */
+static const uint8_t SPDIF_CS_CONSUMER[24] = {
+    0x04, 0x00, 0x00, 0x02, 0x0B,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+static const uint8_t SPDIF_CS_PROFESSIONAL[24] = {
+    0x01, 0x00, 0x00, 0x02, 0x00,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+typedef struct {
+    uint8_t  data_bit;          /* TXD index */
+    uint8_t  bits_per_sample;
+    uint8_t  channel_status[24];
+    uint16_t frame_in_block;    /* 0..191 */
+    uint8_t  bmc_state;         /* running BMC level */
+    uint16_t ticks_per_ui;      /* parlio ticks per BMC unit interval */
+} spdif_state_t;
+
+typedef struct {
+    uint8_t  data_bit;          /* TXD index */
+    uint8_t  nrzi_state;        /* running NRZI level */
+    uint16_t ticks_per_bit;     /* parlio ticks per ADAT bit (1 when ADAT drives the clock) */
+} adat_state_t;
+
+typedef struct {
+    uint8_t  bclk_bit;          /* TXD index for BCLK (unused if bclk_on_clk_out) */
+    uint8_t  lrck_bit;          /* TXD index for LRCK */
+    uint8_t  data_start_bit;    /* first TXD index for audio data */
+    uint8_t  num_data_lines;
+    uint8_t  slot_width;
+    uint8_t  bits_per_sample;
+    uint8_t  num_slots;
+    parlio_audio_i2s_mode_t mode;
+    uint16_t ticks_per_bclk;    /* parlio ticks per BCLK cycle */
+    bool     bclk_on_clk_out;  /* true in I2S-only mode */
+} i2s_state_t;
+
+struct parlio_audio_tx {
+    uint32_t sample_rate;
+    uint32_t parlio_clock;
+    uint16_t ticks_per_frame;   /* parlio_clock / sample_rate */
+    uint8_t  parlio_width;      /* 1, 2, 4, 8, or 16 */
+    uint16_t mclk_multiple;
+
+    /* Protocol states (NULL if not configured) */
+    i2s_state_t   *i2s;
+    spdif_state_t *spdif;
+    adat_state_t  *adat;
+
+    /* Sample layout */
+    size_t samples_per_frame;
+    size_t i2s_offset;
+    size_t spdif_offset;
+    size_t adat_offset;
+
+    /* DMA */
+    size_t   frame_buf_bytes;
+    size_t   dma_buf_bytes;
+    size_t   frames_per_buf;
+    size_t   dma_buf_count;
+    uint8_t  **dma_bufs;
+    size_t   write_buf_idx;
+    size_t   write_frame_pos;
+
+    SemaphoreHandle_t write_sem;
+    i2s_chan_handle_t       i2s_clk_chan;
+    parlio_tx_unit_handle_t parlio_unit;
+    bool enabled;
+};
+
+/* ------------------------------------------------------------------ */
+/*  Utility                                                            */
+/* ------------------------------------------------------------------ */
+
+static uint8_t next_parlio_width(uint8_t needed)
+{
+    if (needed <= 1)  return 1;
+    if (needed <= 2)  return 2;
+    if (needed <= 4)  return 4;
+    if (needed <= 8)  return 8;
+    if (needed <= 16) return 16;
+    return 0;
+}
+
+static inline void write_parlio_word(uint8_t *dst, uint16_t idx,
+                                      uint16_t word, uint8_t pw)
+{
+    if (pw <= 8) {
+        dst[idx] = (uint8_t)word;
+    } else {
+        ((uint16_t *)dst)[idx] = word;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  S/PDIF encoder (frame -> 128-bit BMC buffer)                       */
+/* ------------------------------------------------------------------ */
+
+static inline uint8_t bmc_bit(uint8_t *buf, size_t *ui, uint8_t bit, uint8_t st)
+{
+    st ^= 1;
+    buf[*ui / 8] |= (st << (*ui % 8));
+    (*ui)++;
+    if (bit) st ^= 1;
+    buf[*ui / 8] |= (st << (*ui % 8));
+    (*ui)++;
+    return st;
+}
+
+static inline uint8_t bmc_preamble(uint8_t *buf, size_t *ui,
+                                    const uint8_t pre[2], uint8_t st)
+{
+    uint8_t p = pre[st & 1];
+    for (int i = 0; i < 8; i++) {
+        buf[*ui / 8] |= (((p >> i) & 1) << (*ui % 8));
+        (*ui)++;
+    }
+    return (p >> 7) & 1;
+}
+
+static void encode_spdif_raw(spdif_state_t *s, uint8_t *out,
+                               int32_t left, int32_t right)
+{
+    memset(out, 0, 16);
+    size_t ui = 0;
+
+    for (int sub = 0; sub < 2; sub++) {
+        const uint8_t *pre;
+        if (sub == 0)
+            pre = (s->frame_in_block == 0) ? SPDIF_PRE_B : SPDIF_PRE_M;
+        else
+            pre = SPDIF_PRE_W;
+        s->bmc_state = bmc_preamble(out, &ui, pre, s->bmc_state);
+
+        uint32_t audio = (uint32_t)((sub == 0) ? left : right) >> 8;
+        uint8_t parity = 0;
+        for (int b = 0; b < 24; b++) {
+            uint8_t v = (audio >> b) & 1;
+            s->bmc_state = bmc_bit(out, &ui, v, s->bmc_state);
+            parity ^= v;
+        }
+        s->bmc_state = bmc_bit(out, &ui, 0, s->bmc_state); /* validity */
+        s->bmc_state = bmc_bit(out, &ui, 0, s->bmc_state); /* user data */
+
+        uint8_t cs = 0;
+        if (s->frame_in_block < 192) {
+            uint8_t bi = s->frame_in_block / 8;
+            if (bi < 24) cs = (s->channel_status[bi] >> (s->frame_in_block % 8)) & 1;
+        }
+        s->bmc_state = bmc_bit(out, &ui, cs, s->bmc_state);
+        parity ^= cs;
+        s->bmc_state = bmc_bit(out, &ui, parity, s->bmc_state); /* parity */
+    }
+
+    s->frame_in_block++;
+    if (s->frame_in_block >= 192) s->frame_in_block = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ADAT encoder (frame -> 256-bit NRZI buffer)                        */
+/* ------------------------------------------------------------------ */
+
+static inline void nrzi_bit(uint8_t *buf, size_t *idx, uint8_t bit, uint8_t *st)
+{
+    if (bit) *st ^= 1;
+    if (*st) buf[*idx / 8] |= (1 << (*idx % 8));
+    (*idx)++;
+}
+
+static void encode_adat_raw(adat_state_t *s, uint8_t *out,
+                              const int32_t *samples)
+{
+    memset(out, 0, 32);
+    size_t bi = 0;
+
+    /* Sync: 1 followed by 9 zeros */
+    nrzi_bit(out, &bi, 1, &s->nrzi_state);
+    for (int i = 0; i < 9; i++)
+        nrzi_bit(out, &bi, 0, &s->nrzi_state);
+
+    /* 8 channels */
+    for (int ch = 0; ch < 8; ch++) {
+        uint32_t audio = samples ? ((uint32_t)samples[ch] >> 8) : 0;
+
+        nrzi_bit(out, &bi, 1, &s->nrzi_state); /* channel separator */
+
+        for (int nib = 0; nib < 6; nib++) {
+            int shift = 20 - nib * 4;
+            for (int b = 3; b >= 0; b--)
+                nrzi_bit(out, &bi, (audio >> (shift + b)) & 1, &s->nrzi_state);
+            if (nib < 5)
+                nrzi_bit(out, &bi, 1, &s->nrzi_state); /* nibble separator */
+        }
+    }
+
+    /* Pad to 256 bits */
+    while (bi < 256)
+        nrzi_bit(out, &bi, 0, &s->nrzi_state);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Unified frame encoder                                              */
+/* ------------------------------------------------------------------ */
+
+static void encode_frame(struct parlio_audio_tx *h,
+                          uint8_t *dst,
+                          const int32_t *samples)
+{
+    const uint16_t tpf = h->ticks_per_frame;
+    const uint8_t  pw  = h->parlio_width;
+
+    /* Pre-encode serial protocols into temporary bit buffers */
+    uint8_t spdif_bits[16];
+    uint8_t adat_bits[32];
+
+    if (h->spdif) {
+        const int32_t *sp = samples ? (samples + h->spdif_offset) : NULL;
+        encode_spdif_raw(h->spdif, spdif_bits,
+                         sp ? sp[0] : 0, sp ? sp[1] : 0);
+    }
+    if (h->adat) {
+        const int32_t *ap = samples ? (samples + h->adat_offset) : NULL;
+        encode_adat_raw(h->adat, adat_bits, ap);
+    }
+
+    /* I2S sample pointer */
+    const int32_t *i2s_samp = NULL;
+    if (h->i2s && samples) {
+        i2s_samp = samples + h->i2s_offset;
+    }
+
+    /* Compose each PARLIO tick */
+    for (uint16_t tick = 0; tick < tpf; tick++) {
+        uint16_t word = 0;
+
+        /* --- I2S --- */
+        if (h->i2s) {
+            i2s_state_t *is = h->i2s;
+            uint16_t tpb = is->ticks_per_bclk;
+
+            uint16_t bclk_idx = tick / tpb;
+            uint16_t sub_tick = tick % tpb;
+
+            /* BCLK: high first half, low second half */
+            if (!is->bclk_on_clk_out) {
+                uint8_t bclk_val = (sub_tick < tpb / 2) ? 1 : 0;
+                word |= ((uint16_t)bclk_val << is->bclk_bit);
+            }
+
+            /* LRCK */
+            uint8_t slot = bclk_idx / is->slot_width;
+            uint8_t lrck;
+            if (is->mode == PARLIO_AUDIO_I2S_STANDARD) {
+                lrck = (slot >= 1) ? 1 : 0;
+            } else {
+                lrck = (bclk_idx == 0) ? 1 : 0;
+            }
+            word |= ((uint16_t)lrck << is->lrck_bit);
+
+            /* Data lines: MSB first, 1-BCLK Philips offset */
+            uint16_t pos_in_slot = bclk_idx % is->slot_width;
+            int16_t bit_idx = (int16_t)pos_in_slot - 1;
+
+            if (bit_idx >= 0 && bit_idx < is->bits_per_sample && i2s_samp) {
+                for (uint8_t line = 0; line < is->num_data_lines; line++) {
+                    int32_t samp = i2s_samp[line * is->num_slots + slot];
+                    uint8_t bv = (samp >> (31 - bit_idx)) & 1;
+                    word |= ((uint16_t)bv << (is->data_start_bit + line));
+                }
+            }
+        }
+
+        /* --- S/PDIF --- */
+        if (h->spdif) {
+            uint16_t ui_idx = tick / h->spdif->ticks_per_ui;
+            uint8_t bv = (spdif_bits[ui_idx / 8] >> (ui_idx % 8)) & 1;
+            word |= ((uint16_t)bv << h->spdif->data_bit);
+        }
+
+        /* --- ADAT --- */
+        if (h->adat) {
+            uint16_t bit_i = tick / h->adat->ticks_per_bit;
+            uint8_t bv = (adat_bits[bit_i / 8] >> (bit_i % 8)) & 1;
+            word |= ((uint16_t)bv << h->adat->data_bit);
+        }
+
+        write_parlio_word(dst, tick, word, pw);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  ISR callback                                                       */
+/* ------------------------------------------------------------------ */
+
+static bool IRAM_ATTR on_tx_done(parlio_tx_unit_handle_t unit,
+                                  const parlio_tx_done_event_data_t *edata,
+                                  void *ctx)
+{
+    struct parlio_audio_tx *h = (struct parlio_audio_tx *)ctx;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(h->write_sem, &woken);
+    return woken == pdTRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Public API                                                         */
+/* ------------------------------------------------------------------ */
+
+esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
+                               parlio_audio_tx_handle_t *ret_handle)
+{
+    ESP_RETURN_ON_FALSE(config && ret_handle, ESP_ERR_INVALID_ARG, TAG, "null arg");
+    ESP_RETURN_ON_FALSE(config->i2s || config->spdif || config->adat,
+                        ESP_ERR_INVALID_ARG, TAG, "no protocol configured");
+
+    /* --- Determine protocol clock rates --- */
+    uint32_t fs = config->sample_rate;
+    uint32_t adat_rate  = config->adat  ? 256 * fs : 0;
+    uint32_t spdif_rate = config->spdif ? 128 * fs : 0;
+
+    uint8_t i2s_num_slots = 0;
+    uint32_t i2s_bclk_rate = 0;
+    if (config->i2s) {
+        i2s_num_slots = (uint8_t)config->i2s->mode;
+        if (i2s_num_slots == 0) i2s_num_slots = 2;
+        uint8_t sw = config->i2s->slot_width ? config->i2s->slot_width : 32;
+        i2s_bclk_rate = (uint32_t)sw * i2s_num_slots * fs;
+    }
+
+    bool i2s_only = config->i2s && !config->spdif && !config->adat;
+    bool multi_proto = !i2s_only && config->i2s;
+
+    /* Master PARLIO clock = fastest protocol rate */
+    uint32_t parlio_clock;
+    if (i2s_only) {
+        parlio_clock = i2s_bclk_rate; /* BCLK on clk_out, efficient mode */
+    } else {
+        parlio_clock = adat_rate;
+        if (spdif_rate > parlio_clock) parlio_clock = spdif_rate;
+        if (i2s_bclk_rate > parlio_clock) parlio_clock = i2s_bclk_rate;
+    }
+    ESP_RETURN_ON_FALSE(parlio_clock > 0, ESP_ERR_INVALID_ARG, TAG, "bad clock");
+
+    /* Validate divisibility of each protocol rate into the master clock */
+    if (config->spdif && parlio_clock % spdif_rate != 0) {
+        ESP_LOGE(TAG, "PARLIO clock %"PRIu32" not divisible by S/PDIF rate %"PRIu32,
+                 parlio_clock, spdif_rate);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config->adat && parlio_clock % adat_rate != 0) {
+        ESP_LOGE(TAG, "PARLIO clock %"PRIu32" not divisible by ADAT rate %"PRIu32,
+                 parlio_clock, adat_rate);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config->i2s && !i2s_only && parlio_clock % i2s_bclk_rate != 0) {
+        ESP_LOGE(TAG, "PARLIO clock %"PRIu32" not divisible by I2S BCLK %"PRIu32". "
+                 "Adjust slot_width so BCLK divides evenly into %"PRIu32,
+                 parlio_clock, i2s_bclk_rate, parlio_clock);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t ticks_per_frame = parlio_clock / fs;
+
+    /* --- Validate I2S config --- */
+    if (config->i2s) {
+        const parlio_audio_i2s_config_t *ic = config->i2s;
+        ESP_RETURN_ON_FALSE(ic->num_data_lines >= 1 &&
+                            ic->num_data_lines <= PARLIO_AUDIO_MAX_I2S_DATA_LINES,
+                            ESP_ERR_INVALID_ARG, TAG, "I2S num_data_lines out of range");
+        ESP_RETURN_ON_FALSE(ic->bits_per_sample == 16 || ic->bits_per_sample == 24 ||
+                            ic->bits_per_sample == 32,
+                            ESP_ERR_INVALID_ARG, TAG, "I2S bad bits_per_sample");
+        uint8_t sw = ic->slot_width ? ic->slot_width : 32;
+        ESP_RETURN_ON_FALSE(sw >= ic->bits_per_sample,
+                            ESP_ERR_INVALID_ARG, TAG, "I2S slot_width < bits_per_sample");
+    }
+
+    /* --- Assign TXD bit positions --- */
+    uint8_t bit_cursor = 0;
+    uint8_t i2s_bclk_bit = 0, i2s_lrck_bit = 0, i2s_data_start = 0;
+    uint8_t spdif_bit = 0, adat_bit = 0;
+
+    if (config->i2s) {
+        if (!i2s_only) {
+            /* Multi-protocol: BCLK on a data line */
+            i2s_bclk_bit = bit_cursor++;
+        }
+        i2s_lrck_bit = bit_cursor++;
+        i2s_data_start = bit_cursor;
+        bit_cursor += config->i2s->num_data_lines;
+    }
+    if (config->spdif) {
+        spdif_bit = bit_cursor++;
+    }
+    if (config->adat) {
+        adat_bit = bit_cursor++;
+    }
+
+    uint8_t pw = next_parlio_width(bit_cursor);
+    ESP_RETURN_ON_FALSE(pw > 0 && pw <= 16, ESP_ERR_INVALID_ARG, TAG,
+                        "too many data lines for PARLIO (need %u, max 16)", bit_cursor);
+
+    /* --- MCLK multiple --- */
+    uint16_t mclk_mult = config->mclk_multiple;
+    if (mclk_mult == 0) {
+        /* Auto: smallest multiple of ticks_per_frame that's >= ticks_per_frame */
+        mclk_mult = ticks_per_frame;
+        /* Ensure it's a supported I2S mclk_multiple value (multiple of 128 or 256) */
+        if (mclk_mult < 256) mclk_mult = 256;
+    }
+    ESP_RETURN_ON_FALSE(mclk_mult >= ticks_per_frame,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "mclk_multiple (%u) < ticks_per_frame (%u)", mclk_mult, ticks_per_frame);
+    ESP_RETURN_ON_FALSE(mclk_mult % ticks_per_frame == 0,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "mclk_multiple (%u) not divisible by ticks_per_frame (%u)",
+                        mclk_mult, ticks_per_frame);
+
+    /* --- Allocate handle --- */
+    struct parlio_audio_tx *h = calloc(1, sizeof(*h));
+    ESP_RETURN_ON_FALSE(h, ESP_ERR_NO_MEM, TAG, "alloc handle");
+    esp_err_t ret = ESP_OK;
+
+    h->sample_rate   = fs;
+    h->parlio_clock  = parlio_clock;
+    h->ticks_per_frame = ticks_per_frame;
+    h->parlio_width  = pw;
+    h->mclk_multiple = mclk_mult;
+
+    /* --- Populate protocol states --- */
+    if (config->i2s) {
+        h->i2s = calloc(1, sizeof(i2s_state_t));
+        ESP_GOTO_ON_FALSE(h->i2s, ESP_ERR_NO_MEM, fail, TAG, "alloc i2s state");
+        uint8_t sw = config->i2s->slot_width ? config->i2s->slot_width : 32;
+        h->i2s->bclk_bit       = i2s_bclk_bit;
+        h->i2s->lrck_bit       = i2s_lrck_bit;
+        h->i2s->data_start_bit = i2s_data_start;
+        h->i2s->num_data_lines = config->i2s->num_data_lines;
+        h->i2s->slot_width     = sw;
+        h->i2s->bits_per_sample = config->i2s->bits_per_sample;
+        h->i2s->num_slots      = i2s_num_slots;
+        h->i2s->mode           = config->i2s->mode ? config->i2s->mode : PARLIO_AUDIO_I2S_STANDARD;
+        h->i2s->bclk_on_clk_out = i2s_only;
+        h->i2s->ticks_per_bclk = i2s_only ? 1 : (parlio_clock / i2s_bclk_rate);
+    }
+
+    if (config->spdif) {
+        h->spdif = calloc(1, sizeof(spdif_state_t));
+        ESP_GOTO_ON_FALSE(h->spdif, ESP_ERR_NO_MEM, fail, TAG, "alloc spdif state");
+        h->spdif->data_bit = spdif_bit;
+        h->spdif->bits_per_sample = config->spdif->bits_per_sample ? config->spdif->bits_per_sample : 24;
+        h->spdif->ticks_per_ui = parlio_clock / (128 * fs);
+        memcpy(h->spdif->channel_status,
+               config->spdif->consumer_format ? SPDIF_CS_CONSUMER : SPDIF_CS_PROFESSIONAL, 24);
+    }
+
+    if (config->adat) {
+        h->adat = calloc(1, sizeof(adat_state_t));
+        ESP_GOTO_ON_FALSE(h->adat, ESP_ERR_NO_MEM, fail, TAG, "alloc adat state");
+        h->adat->data_bit = adat_bit;
+        h->adat->ticks_per_bit = parlio_clock / (256 * fs);
+    }
+
+    /* --- Sample layout --- */
+    size_t offset = 0;
+    if (h->i2s) {
+        h->i2s_offset = offset;
+        offset += h->i2s->num_data_lines * h->i2s->num_slots;
+    }
+    if (h->spdif) {
+        h->spdif_offset = offset;
+        offset += 2;
+    }
+    if (h->adat) {
+        h->adat_offset = offset;
+        offset += 8;
+    }
+    h->samples_per_frame = offset;
+
+    /* --- DMA buffers --- */
+    h->frames_per_buf = config->frames_per_buffer ? config->frames_per_buffer : 64;
+    h->dma_buf_count  = config->dma_buffer_count  ? config->dma_buffer_count  : 4;
+
+    size_t bytes_per_tick = (pw <= 8) ? 1 : 2;
+    h->frame_buf_bytes = ticks_per_frame * bytes_per_tick;
+    h->dma_buf_bytes   = h->frame_buf_bytes * h->frames_per_buf;
+
+    h->dma_bufs = calloc(h->dma_buf_count, sizeof(uint8_t *));
+    ESP_GOTO_ON_FALSE(h->dma_bufs, ESP_ERR_NO_MEM, fail, TAG, "alloc buf array");
+    for (size_t i = 0; i < h->dma_buf_count; i++) {
+        h->dma_bufs[i] = heap_caps_calloc(1, h->dma_buf_bytes,
+                                           MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        ESP_GOTO_ON_FALSE(h->dma_bufs[i], ESP_ERR_NO_MEM, fail, TAG, "alloc DMA buf");
+    }
+
+    h->write_sem = xSemaphoreCreateCounting(h->dma_buf_count, h->dma_buf_count);
+    ESP_GOTO_ON_FALSE(h->write_sem, ESP_ERR_NO_MEM, fail, TAG, "alloc semaphore");
+
+    /* --- I2S MCLK from APLL --- */
+    {
+        i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+        cc.dma_desc_num = 2; cc.dma_frame_num = 16;
+        ret = i2s_new_channel(&cc, &h->i2s_clk_chan, NULL);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock channel alloc failed");
+
+        i2s_std_config_t sc = {
+            .clk_cfg = { .sample_rate_hz = fs, .clk_src = I2S_CLK_SRC_APLL,
+                         .mclk_multiple = (i2s_mclk_multiple_t)mclk_mult },
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                             I2S_SLOT_MODE_STEREO),
+            .gpio_cfg = { .mclk = config->mclk_gpio,
+                          .bclk = I2S_GPIO_UNUSED, .ws = I2S_GPIO_UNUSED,
+                          .dout = I2S_GPIO_UNUSED, .din = I2S_GPIO_UNUSED },
+        };
+        ret = i2s_channel_init_std_mode(h->i2s_clk_chan, &sc);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock init failed");
+        ret = i2s_channel_enable(h->i2s_clk_chan);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock enable failed");
+    }
+
+    /* --- PARLIO TX unit --- */
+    {
+        uint32_t mclk_freq = (uint32_t)mclk_mult * fs;
+        parlio_tx_unit_config_t pc = {
+            .clk_src = PARLIO_CLK_SRC_DEFAULT,
+            .clk_in_gpio_num = config->mclk_gpio,
+            .input_clk_src_freq_hz = mclk_freq,
+            .output_clk_freq_hz = parlio_clock,
+            .data_width = pw,
+            .clk_out_gpio_num = config->clk_out_gpio,
+            .valid_gpio_num = -1,
+            .trans_queue_depth = h->dma_buf_count,
+            .max_transfer_size = h->dma_buf_bytes,
+            .sample_edge = PARLIO_SAMPLE_EDGE_POS,
+            .bit_pack_order = PARLIO_BIT_PACK_ORDER_LSB,
+            .flags = { .clk_gate_en = 0, .io_loop_back = 0 },
+        };
+
+        for (int i = 0; i < 16; i++) pc.data_gpio_nums[i] = -1;
+
+        if (h->i2s) {
+            if (i2s_only) {
+                /* BCLK on clk_out (already set above), LRCK on TXD[0], data on TXD[1+] */
+                pc.clk_out_gpio_num = config->i2s->bclk_gpio;
+            } else {
+                pc.data_gpio_nums[i2s_bclk_bit] = config->i2s->bclk_gpio;
+            }
+            pc.data_gpio_nums[i2s_lrck_bit] = config->i2s->lrck_gpio;
+            for (uint8_t i = 0; i < config->i2s->num_data_lines; i++) {
+                pc.data_gpio_nums[i2s_data_start + i] = config->i2s->data_gpios[i];
+            }
+        }
+        if (h->spdif) {
+            pc.data_gpio_nums[spdif_bit] = config->spdif->spdif_gpio;
+        }
+        if (h->adat) {
+            pc.data_gpio_nums[adat_bit] = config->adat->adat_gpio;
+        }
+
+        ret = parlio_new_tx_unit(&pc, &h->parlio_unit);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "PARLIO create failed");
+
+        parlio_tx_event_callbacks_t cbs = { .on_trans_done = on_tx_done };
+        ret = parlio_tx_unit_register_event_callbacks(h->parlio_unit, &cbs, h);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "PARLIO callbacks failed");
+    }
+
+    /* --- Log summary --- */
+    ESP_LOGI(TAG, "parlio_clock=%"PRIu32" Hz, ticks/frame=%u, width=%u, MCLK=%"PRIu32" Hz",
+             parlio_clock, ticks_per_frame, pw, (uint32_t)mclk_mult * fs);
+    ESP_LOGI(TAG, "%u samples/frame, frame_buf=%u B, dma=%u B x %u",
+             (unsigned)h->samples_per_frame, (unsigned)h->frame_buf_bytes,
+             (unsigned)h->dma_buf_bytes, (unsigned)h->dma_buf_count);
+    if (h->i2s)   ESP_LOGI(TAG, "  I2S: %u lines x %u slots, BCLK=%s, ticks/bclk=%u",
+                            h->i2s->num_data_lines, h->i2s->num_slots,
+                            h->i2s->bclk_on_clk_out ? "clk_out" : "TXD",
+                            h->i2s->ticks_per_bclk);
+    if (h->spdif) ESP_LOGI(TAG, "  SPDIF: TXD[%u], ticks/ui=%u", h->spdif->data_bit, h->spdif->ticks_per_ui);
+    if (h->adat)  ESP_LOGI(TAG, "  ADAT: TXD[%u], ticks/bit=%u", h->adat->data_bit, h->adat->ticks_per_bit);
+
+    *ret_handle = h;
+    return ESP_OK;
+
+fail:
+    parlio_audio_tx_delete(h);
+    return ESP_FAIL;
+}
+
+esp_err_t parlio_audio_tx_enable(parlio_audio_tx_handle_t handle)
+{
+    ESP_RETURN_ON_FALSE(handle && !handle->enabled, ESP_ERR_INVALID_STATE, TAG, "bad state");
+    ESP_RETURN_ON_ERROR(parlio_tx_unit_enable(handle->parlio_unit), TAG, "enable failed");
+
+    handle->enabled = true;
+    handle->write_buf_idx = 0;
+    handle->write_frame_pos = 0;
+
+    /* Reset encoder states */
+    if (handle->spdif) { handle->spdif->frame_in_block = 0; handle->spdif->bmc_state = 0; }
+    if (handle->adat)  { handle->adat->nrzi_state = 0; }
+
+    /* Pre-fill with silence */
+    for (size_t i = 0; i < handle->dma_buf_count; i++) {
+        for (size_t f = 0; f < handle->frames_per_buf; f++) {
+            uint8_t *dst = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
+            encode_frame(handle, dst, NULL);
+        }
+        parlio_transmit_config_t tc = { .idle_value = 0 };
+        ESP_RETURN_ON_ERROR(
+            parlio_tx_unit_transmit(handle->parlio_unit, handle->dma_bufs[i],
+                                    handle->dma_buf_bytes * 8, &tc),
+            TAG, "silence transmit failed");
+        xSemaphoreTake(handle->write_sem, 0);
+    }
+
+    ESP_LOGI(TAG, "enabled, Fs=%"PRIu32, handle->sample_rate);
+    return ESP_OK;
+}
+
+esp_err_t parlio_audio_tx_disable(parlio_audio_tx_handle_t handle)
+{
+    if (!handle || !handle->enabled) return ESP_OK;
+    parlio_tx_unit_wait_all_done(handle->parlio_unit, 500);
+    parlio_tx_unit_disable(handle->parlio_unit);
+    handle->enabled = false;
+    return ESP_OK;
+}
+
+esp_err_t parlio_audio_tx_write(parlio_audio_tx_handle_t handle,
+                                 const int32_t *samples,
+                                 size_t num_frames,
+                                 size_t *frames_written,
+                                 uint32_t timeout_ms)
+{
+    ESP_RETURN_ON_FALSE(handle && samples && handle->enabled,
+                        ESP_ERR_INVALID_ARG, TAG, "bad arg/state");
+
+    const size_t spf = handle->samples_per_frame;
+    size_t written = 0;
+
+    while (written < num_frames) {
+        if (handle->write_frame_pos >= handle->frames_per_buf) {
+            parlio_transmit_config_t tc = { .idle_value = 0 };
+            esp_err_t ret = parlio_tx_unit_transmit(
+                handle->parlio_unit, handle->dma_bufs[handle->write_buf_idx],
+                handle->dma_buf_bytes * 8, &tc);
+            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
+
+            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
+            handle->write_frame_pos = 0;
+
+            if (xSemaphoreTake(handle->write_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+                if (frames_written) *frames_written = written;
+                return ESP_ERR_TIMEOUT;
+            }
+        }
+
+        uint8_t *dst = handle->dma_bufs[handle->write_buf_idx]
+                     + handle->write_frame_pos * handle->frame_buf_bytes;
+        encode_frame(handle, dst, &samples[written * spf]);
+        handle->write_frame_pos++;
+        written++;
+    }
+
+    if (frames_written) *frames_written = written;
+    return ESP_OK;
+}
+
+esp_err_t parlio_audio_tx_delete(parlio_audio_tx_handle_t handle)
+{
+    if (!handle) return ESP_OK;
+    if (handle->enabled) parlio_audio_tx_disable(handle);
+    if (handle->parlio_unit) parlio_del_tx_unit(handle->parlio_unit);
+    if (handle->i2s_clk_chan) {
+        i2s_channel_disable(handle->i2s_clk_chan);
+        i2s_del_channel(handle->i2s_clk_chan);
+    }
+    if (handle->dma_bufs) {
+        for (size_t i = 0; i < handle->dma_buf_count; i++) free(handle->dma_bufs[i]);
+        free(handle->dma_bufs);
+    }
+    if (handle->write_sem) vSemaphoreDelete(handle->write_sem);
+    free(handle->i2s);
+    free(handle->spdif);
+    free(handle->adat);
+    free(handle);
+    return ESP_OK;
+}
+
+size_t parlio_audio_tx_get_frame_size(parlio_audio_tx_handle_t handle)
+{
+    return handle ? handle->samples_per_frame : 0;
+}
+
+uint32_t parlio_audio_tx_get_parlio_clock(parlio_audio_tx_handle_t handle)
+{
+    return handle ? handle->parlio_clock : 0;
+}
