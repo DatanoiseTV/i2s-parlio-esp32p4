@@ -1,11 +1,23 @@
 # PARLIO Audio Transmitter for ESP32-P4
 
-Multi-protocol audio transmitter that abuses the Parallel IO peripheral on the ESP32-P4 to synthesize digital audio output signals, clocked by the APLL for sample-accurate timing.
+Multi-protocol audio transmitter that abuses the Parallel IO peripheral on the ESP32-P4 to synthesize digital audio output signals, clocked by the APLL for sample-accurate timing. All outputs can run simultaneously from a single PARLIO TX unit, sample-locked with zero inter-protocol skew.
 
-Supported protocols:
-- **I2S / TDM** -- up to 240 channels (15 data lines x 16 TDM slots), Philips or TDM framing
-- **S/PDIF** -- stereo IEC60958 with biphase mark coding, single wire output
-- **ADAT Lightpipe** -- 8 channels of 24-bit audio with NRZI encoding, single wire output
+Supported protocols (any combination, all simultaneous):
+- **I2S / TDM** (via PARLIO) -- up to 240 channels (15 data lines x 16 TDM slots)
+- **S/PDIF** -- stereo IEC60958 with biphase mark coding, single wire
+- **ADAT Lightpipe** -- 8 channels of 24-bit audio with NRZI encoding, single wire
+- **I2S / TDM** (via I2S HW) -- the I2S peripheral used for clock generation can simultaneously output real audio on its own pins (up to 32 extra channels via TDM16 on I2S0)
+
+### Maximum channel counts
+
+| Scenario | Breakdown | Total |
+|----------|-----------|-------|
+| PARLIO TDM16 only | 15 lines x 16 slots | **240 ch** |
+| PARLIO TDM16 + I2S HW TDM16 (all 3 peripherals) | 240 + 32 + 16 + 16 | **304 ch** |
+| PARLIO I2S (12 lines) + SPDIF + ADAT + I2S0 TDM16 x2 | 24 + 2 + 8 + 32 | **66 ch** (mixed protocol) |
+| PARLIO ADAT + I2S0 TDM16 x2 + I2S1 TDM16 + I2S2 TDM16 | 8 + 32 + 16 + 16 | **72 ch** (with ADAT) |
+
+All outputs share the same APLL clock -- zero inter-channel and inter-protocol clock drift
 
 ## How it works
 
@@ -228,16 +240,50 @@ int32_t samples[18] = { ... };
 parlio_audio_tx_write(tx, samples, 1, NULL, 1000);
 ```
 
+### I2S HW Passthrough
+
+The I2S peripheral used for APLL clock generation is normally idle (only MCLK output). With the `i2s_hw` config, it also outputs real audio on its own BCLK/WS/DOUT pins -- zero additional peripheral cost. Write to it via the standard ESP-IDF `i2s_channel_write()` API.
+
+```c
+parlio_audio_i2s_hw_config_t hw_cfg = {
+    .bits_per_sample = 32,
+    .total_slots = 8,                   /* TDM8 on the I2S HW peripheral */
+    .bclk_gpio = GPIO_NUM_30,
+    .ws_gpio   = GPIO_NUM_31,
+    .dout_gpio = GPIO_NUM_32,
+    .dout2_gpio = -1,                   /* second DOUT available on I2S0 only */
+};
+
+parlio_audio_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .mclk_gpio = GPIO_NUM_20,
+    .adat = &adat_cfg,                  /* 8 ch ADAT via PARLIO */
+    .i2s_hw = &hw_cfg,                  /* 8 ch TDM via I2S HW */
+};
+
+parlio_audio_tx_handle_t tx;
+parlio_audio_tx_new(&cfg, &tx);
+parlio_audio_tx_enable(tx);
+
+/* Write ADAT via PARLIO path */
+parlio_audio_tx_write(tx, adat_samples, num_frames, NULL, 1000);
+
+/* Write I2S HW via standard ESP-IDF API (sample-locked, same APLL) */
+i2s_chan_handle_t i2s_hw = parlio_audio_tx_get_i2s_hw_handle(tx);
+i2s_channel_write(i2s_hw, tdm_samples, size, &bytes_written, 1000);
+```
+
 ### Resource usage per combination
 
-| Configuration | PARLIO clock | Data width | DMA/frame | Total channels |
-|---------------|-------------|------------|-----------|----------------|
-| I2S only (4 lines) | 64*Fs | 8-bit | 64 B | 8 |
-| ADAT only | 256*Fs | 1-bit | 32 B | 8 |
-| S/PDIF only | 128*Fs | 1-bit | 16 B | 2 |
-| I2S (4) + ADAT | 256*Fs | 8-bit | 256 B | 16 |
-| I2S (4) + SPDIF + ADAT | 256*Fs | 8-bit | 256 B | 18 |
-| I2S (12) + SPDIF + ADAT | 256*Fs | 16-bit | 512 B | 34 |
+| Configuration | PARLIO clock | Data width | DMA/frame | PARLIO ch | I2S HW ch | Total |
+|---------------|-------------|------------|-----------|-----------|-----------|-------|
+| I2S only (4 lines) | 64*Fs | 8-bit | 64 B | 8 | -- | 8 |
+| ADAT only | 256*Fs | 1-bit | 32 B | 8 | -- | 8 |
+| ADAT + I2S HW TDM8 | 256*Fs | 1-bit | 32 B | 8 | 8 | 16 |
+| I2S (4) + SPDIF + ADAT | 256*Fs | 8-bit | 256 B | 18 | -- | 18 |
+| I2S (4) + SPDIF + ADAT + I2S HW TDM16 | 256*Fs | 8-bit | 256 B | 18 | 16 | 34 |
+| I2S (12) + SPDIF + ADAT + I2S HW TDM16x2 | 256*Fs | 16-bit | 512 B | 34 | 32 | 66 |
+| Max (all I2S peripherals) | 256*Fs | 16-bit | 512 B | 34 | 64 | 98 |
 
 ## Build
 
