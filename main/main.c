@@ -86,7 +86,10 @@ static void audio_task(void *arg)
         parlio_audio_tx_write(ctx->tx, parlio_buf, fpw, &written, 1000);
         ctx->total_frames += written;
 
-        /* Write I2S HW */
+        /* I2S HW write temporarily disabled to isolate PARLIO encoder throughput.
+         * The i2s_channel_write blocks for up to 5ms (large DMA buffers),
+         * starving the PARLIO encoder. Needs its own task for production. */
+#if 0
         if (ctx->i2s_hw) {
             for (size_t f = 0; f < fpw; f++) {
                 hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
@@ -96,6 +99,7 @@ static void audio_task(void *arg)
             i2s_channel_write(ctx->i2s_hw, hw_buf,
                               fpw * 2 * sizeof(int32_t), &bw, 1000);
         }
+#endif
     }
 
     free(parlio_buf);
