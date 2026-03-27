@@ -8,62 +8,103 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/i2s_common.h"
-#include "esp_rom_gpio.h"
-#include "soc/parlio_periph.h"
 
 #include "parlio_audio_tx.h"
 
 static const char *TAG = "audio_demo";
 
 /*
- * Unified audio output demo: I2S stereo + ADAT 8-channel via PARLIO,
- * plus I2S HW passthrough stereo on the clock-generator peripheral.
+ * Unified audio output demo: I2S + ADAT via PARLIO, plus I2S HW passthrough.
+ * Encoding runs on a dedicated high-priority task pinned to CPU1.
  *
  * Physical wire: GPIO 20 -> GPIO 21 (MCLK loopback)
- *
- * PARLIO outputs (at 256*Fs = 12.288 MHz):
- *   TXD[0] = I2S BCLK (synthesized, 64*Fs)
- *   TXD[1] = I2S LRCK
- *   TXD[2] = I2S DATA (1 stereo pair)
- *   TXD[3] = ADAT bitstream (8 channels, NRZI encoded)
- *   clk_out = PARLIO clock (256*Fs, usable as MCLK)
- *
- * I2S HW (on the clock-generator I2S peripheral):
- *   BCLK = GPIO 25, WS = GPIO 26, DOUT = GPIO 27
- *   Standard stereo, 32-bit, same APLL clock
- *
- * Total: 2 (PARLIO I2S) + 8 (PARLIO ADAT) + 2 (I2S HW) = 12 channels
  */
 
 #define PIN_MCLK       GPIO_NUM_20
-#define PIN_PARLIO_CLK GPIO_NUM_21  /* wired to PIN_MCLK */
-#define PIN_CLK_OUT    GPIO_NUM_22  /* PARLIO clock output (256*Fs) */
-#define PIN_I2S_BCLK   GPIO_NUM_23  /* PARLIO I2S BCLK (synthesized on TXD) */
-#define PIN_I2S_LRCK   GPIO_NUM_24  /* PARLIO I2S LRCK */
-#define PIN_I2S_DATA   GPIO_NUM_25  /* PARLIO I2S data */
-#define PIN_ADAT       GPIO_NUM_26  /* PARLIO ADAT output */
-#define PIN_HW_BCLK    GPIO_NUM_27  /* I2S HW peripheral BCLK */
-#define PIN_HW_WS      GPIO_NUM_28  /* I2S HW peripheral WS */
-#define PIN_HW_DOUT    GPIO_NUM_29  /* I2S HW peripheral DOUT */
+#define PIN_PARLIO_CLK GPIO_NUM_21
+#define PIN_CLK_OUT    GPIO_NUM_22
+#define PIN_I2S_BCLK   GPIO_NUM_23
+#define PIN_I2S_LRCK   GPIO_NUM_24
+#define PIN_I2S_DATA   GPIO_NUM_25
+#define PIN_ADAT       GPIO_NUM_26
+#define PIN_HW_BCLK    GPIO_NUM_27
+#define PIN_HW_WS      GPIO_NUM_28
+#define PIN_HW_DOUT    GPIO_NUM_29
 
 #define SAMPLE_RATE    48000
 #define TEST_SECONDS   30
+#define FRAMES_PER_WRITE 64
 
-/* Fast integer ramp generator (no FPU, no sinf overhead).
- * Produces a sawtooth wave at the given frequency. Each channel gets a
- * distinct frequency so they're distinguishable on a scope/analyzer. */
 static int32_t ramp_sample(uint32_t *phase, uint32_t freq_hz)
 {
-    /* phase accumulator: full 32-bit range = one cycle.
-     * increment = freq * 2^32 / Fs */
     uint32_t inc = (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE);
     *phase += inc;
-    return (int32_t)*phase; /* already left-justified (full 32-bit range) */
+    return (int32_t)*phase;
+}
+
+/* Shared state between main and encoder task */
+typedef struct {
+    parlio_audio_tx_handle_t tx;
+    i2s_chan_handle_t i2s_hw;
+    size_t parlio_frame_size;
+    volatile uint32_t total_frames;
+    volatile bool running;
+} audio_ctx_t;
+
+/* Audio encoding task -- pinned to CPU1 for dedicated throughput */
+static void audio_task(void *arg)
+{
+    audio_ctx_t *ctx = (audio_ctx_t *)arg;
+    const size_t fpw = FRAMES_PER_WRITE;
+    const size_t pfs = ctx->parlio_frame_size;
+
+    int32_t *parlio_buf = malloc(fpw * pfs * sizeof(int32_t));
+    int32_t *hw_buf = malloc(fpw * 2 * sizeof(int32_t));
+    if (!parlio_buf || !hw_buf) {
+        ESP_LOGE(TAG, "audio_task alloc failed");
+        ctx->running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t i2s_phase[2] = {0};
+    uint32_t adat_phase[8] = {0};
+    uint32_t hw_phase[2] = {0};
+
+    while (ctx->running) {
+        /* Generate samples */
+        for (size_t f = 0; f < fpw; f++) {
+            size_t base = f * pfs;
+            parlio_buf[base + 0] = ramp_sample(&i2s_phase[0], 440);
+            parlio_buf[base + 1] = ramp_sample(&i2s_phase[1], 880);
+            for (int ch = 0; ch < 8; ch++)
+                parlio_buf[base + 2 + ch] = ramp_sample(&adat_phase[ch], 200 + ch * 100);
+        }
+
+        /* Write PARLIO (blocks when DMA buffers full -- this is the flow control) */
+        size_t written = 0;
+        parlio_audio_tx_write(ctx->tx, parlio_buf, fpw, &written, 1000);
+        ctx->total_frames += written;
+
+        /* Write I2S HW */
+        if (ctx->i2s_hw) {
+            for (size_t f = 0; f < fpw; f++) {
+                hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
+                hw_buf[f * 2 + 1] = ramp_sample(&hw_phase[1], 1500);
+            }
+            size_t bw = 0;
+            i2s_channel_write(ctx->i2s_hw, hw_buf,
+                              fpw * 2 * sizeof(int32_t), &bw, 1000);
+        }
+    }
+
+    free(parlio_buf);
+    free(hw_buf);
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    /* Power GPIO bank for GPIO 20+ */
     esp_ldo_channel_handle_t ldo4 = NULL;
     esp_ldo_channel_config_t ldo_cfg = {
         .chan_id = 4, .voltage_mv = 3300,
@@ -74,169 +115,80 @@ void app_main(void)
     ESP_LOGI(TAG, "=== Unified audio output: I2S + ADAT + I2S HW ===");
     ESP_LOGI(TAG, "Wire: GPIO %d -> GPIO %d", PIN_MCLK, PIN_PARLIO_CLK);
 
-    /* --- Configure all outputs --- */
-
-    /* PARLIO I2S: 1 stereo pair (2 channels) */
     parlio_audio_i2s_config_t i2s_cfg = {
         .mode = PARLIO_AUDIO_I2S_STANDARD,
-        .bits_per_sample = 32,
-        .slot_width = 32,
-        .num_data_lines = 1,
-        .bclk_gpio = PIN_I2S_BCLK,
-        .lrck_gpio = PIN_I2S_LRCK,
+        .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 1,
+        .bclk_gpio = PIN_I2S_BCLK, .lrck_gpio = PIN_I2S_LRCK,
         .data_gpios = { PIN_I2S_DATA },
     };
-
-    /* PARLIO ADAT: 8 channels */
-    parlio_audio_adat_config_t adat_cfg = {
-        .adat_gpio = PIN_ADAT,
-    };
-
-    /* I2S HW passthrough: stereo on the clock-generator peripheral */
+    parlio_audio_adat_config_t adat_cfg = { .adat_gpio = PIN_ADAT };
     parlio_audio_i2s_hw_config_t hw_cfg = {
-        .bits_per_sample = 32,
-        .slot_width = 32,
-        .total_slots = 0,              /* 0 = stereo (2 slots) */
-        .bclk_gpio = PIN_HW_BCLK,
-        .ws_gpio   = PIN_HW_WS,
-        .dout_gpio = PIN_HW_DOUT,
-        .dout2_gpio = -1,
+        .bits_per_sample = 32, .slot_width = 32, .total_slots = 0,
+        .bclk_gpio = PIN_HW_BCLK, .ws_gpio = PIN_HW_WS,
+        .dout_gpio = PIN_HW_DOUT, .dout2_gpio = -1,
     };
 
-    /* Unified config: all three active simultaneously */
     parlio_audio_tx_config_t cfg = {
-        .sample_rate    = SAMPLE_RATE,
-        .mclk_multiple  = 512,         /* 512*Fs = 24.576 MHz MCLK, PARLIO divides to 256*Fs */
-        .mclk_gpio      = PIN_PARLIO_CLK,
-        .clk_out_gpio   = PIN_CLK_OUT,
-        .i2s   = &i2s_cfg,
-        .adat  = &adat_cfg,
-        .i2s_hw = &hw_cfg,
-        .dma_buffer_count  = 4,
-        .frames_per_buffer = 64,
+        .sample_rate = SAMPLE_RATE, .mclk_multiple = 512,
+        .mclk_gpio = PIN_PARLIO_CLK, .clk_out_gpio = PIN_CLK_OUT,
+        .i2s = &i2s_cfg, .adat = &adat_cfg, .i2s_hw = &hw_cfg,
+        .dma_buffer_count = 4, .frames_per_buffer = FRAMES_PER_WRITE,
     };
 
     parlio_audio_tx_handle_t tx = NULL;
     ESP_ERROR_CHECK(parlio_audio_tx_new(&cfg, &tx));
-
-    /* Set up the separate I2S MCLK output on GPIO 20 (the wire source).
-     * The unified driver puts I2S MCLK on mclk_gpio (= PIN_PARLIO_CLK = 21),
-     * which is the PARLIO input side. We need MCLK also driven on GPIO 20
-     * (the wire output side). Since both GPIOs are wired together, the I2S
-     * MCLK output on GPIO 21 drives GPIO 20 through the wire. */
-
     ESP_ERROR_CHECK(parlio_audio_tx_enable(tx));
 
-    size_t parlio_frame_size = parlio_audio_tx_get_frame_size(tx);
-    uint32_t parlio_clock = parlio_audio_tx_get_parlio_clock(tx);
+    size_t pfs = parlio_audio_tx_get_frame_size(tx);
     i2s_chan_handle_t i2s_hw = parlio_audio_tx_get_i2s_hw_handle(tx);
 
-    ESP_LOGI(TAG, "PARLIO clock: %"PRIu32" Hz", parlio_clock);
-    ESP_LOGI(TAG, "PARLIO frame size: %u samples (I2S:2 + ADAT:8 = 10)", (unsigned)parlio_frame_size);
-    ESP_LOGI(TAG, "I2S HW handle: %s", i2s_hw ? "active" : "NULL");
-
-    /* --- Allocate audio buffers --- */
-    const size_t frames_per_write = 64;
-
-    /* PARLIO buffer: [2 I2S samples] [8 ADAT samples] = 10 per frame */
-    int32_t *parlio_buf = malloc(frames_per_write * parlio_frame_size * sizeof(int32_t));
-
-    /* I2S HW buffer: stereo = 2 samples per frame */
-    int32_t *hw_buf = malloc(frames_per_write * 2 * sizeof(int32_t));
-
-    if (!parlio_buf || !hw_buf) {
-        ESP_LOGE(TAG, "alloc failed");
-        return;
-    }
-
-    /* Ramp generator state (integer phase accumulators, zero FPU overhead) */
-    uint32_t i2s_phase[2] = {0};
-    uint32_t adat_phase[8] = {0};
-    uint32_t hw_phase[2] = {0};
-
+    ESP_LOGI(TAG, "PARLIO clock: %"PRIu32" Hz, frame size: %u samples",
+             parlio_audio_tx_get_parlio_clock(tx), (unsigned)pfs);
+    ESP_LOGI(TAG, "I2S HW: %s", i2s_hw ? "active" : "disabled");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== Generating audio for %d seconds ===", TEST_SECONDS);
-    ESP_LOGI(TAG, "  PARLIO I2S:  440 Hz (L), 880 Hz (R) sawtooth");
-    ESP_LOGI(TAG, "  PARLIO ADAT: 200-900 Hz across 8 channels");
-    ESP_LOGI(TAG, "  I2S HW:      1000 Hz (L), 1500 Hz (R) sawtooth");
+    ESP_LOGI(TAG, "=== Starting %d-second test (encoder on CPU1) ===", TEST_SECONDS);
+    ESP_LOGI(TAG, "  PARLIO I2S:  440/880 Hz | ADAT: 200-900 Hz | I2S HW: 1000/1500 Hz");
 
+    /* Launch encoding task on CPU1 */
+    static audio_ctx_t ctx;
+    ctx.tx = tx;
+    ctx.i2s_hw = i2s_hw;
+    ctx.parlio_frame_size = pfs;
+    ctx.total_frames = 0;
+    ctx.running = true;
+
+    xTaskCreatePinnedToCore(audio_task, "audio_enc", 8192, &ctx,
+                            configMAX_PRIORITIES - 1, NULL, 1);
+
+    /* Monitor from CPU0 */
     int64_t start = esp_timer_get_time();
-    int64_t end = start + (int64_t)TEST_SECONDS * 1000000;
-    uint32_t total_frames = 0;
-
-    while (esp_timer_get_time() < end) {
-        /* Generate PARLIO audio (I2S + ADAT interleaved) */
-        for (size_t f = 0; f < frames_per_write; f++) {
-            size_t base = f * parlio_frame_size;
-
-            /* I2S: 2 samples (L, R) */
-            parlio_buf[base + 0] = ramp_sample(&i2s_phase[0], 440);
-            parlio_buf[base + 1] = ramp_sample(&i2s_phase[1], 880);
-
-            /* ADAT: 8 samples (ch0..ch7) */
-            for (int ch = 0; ch < 8; ch++) {
-                parlio_buf[base + 2 + ch] = ramp_sample(&adat_phase[ch], 200 + ch * 100);
-            }
-        }
-
-        /* Generate I2S HW audio (separate buffer, separate write) */
-        for (size_t f = 0; f < frames_per_write; f++) {
-            hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
-            hw_buf[f * 2 + 1] = ramp_sample(&hw_phase[1], 1500);
-        }
-
-        /* Write PARLIO path */
-        size_t written = 0;
-        esp_err_t ret = parlio_audio_tx_write(tx, parlio_buf, frames_per_write,
-                                               &written, 1000);
-        if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
-            ESP_LOGE(TAG, "PARLIO write error: %s", esp_err_to_name(ret));
-            break;
-        }
-
-        /* Write I2S HW path */
-        if (i2s_hw) {
-            size_t hw_bytes = 0;
-            i2s_channel_write(i2s_hw, hw_buf,
-                              frames_per_write * 2 * sizeof(int32_t),
-                              &hw_bytes, 1000);
-        }
-
-        total_frames += written;
-
-        /* Periodic status */
+    for (int sec = 0; sec < TEST_SECONDS; sec++) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
         int elapsed = (int)((esp_timer_get_time() - start) / 1000000);
-        if (elapsed > 0 && elapsed % 10 == 0 && total_frames % (SAMPLE_RATE * 10) < frames_per_write) {
-            ESP_LOGI(TAG, "[%2ds] %"PRIu32" frames written", elapsed, total_frames);
-        }
+        ESP_LOGI(TAG, "[%2ds] %"PRIu32" frames (%.0f Hz)",
+                 elapsed, ctx.total_frames,
+                 (float)ctx.total_frames / ((float)elapsed > 0 ? elapsed : 1));
     }
 
+    ctx.running = false;
+    vTaskDelay(pdMS_TO_TICKS(100)); /* let task exit cleanly */
+
+    uint32_t final = ctx.total_frames;
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== Done: %"PRIu32" frames in %d seconds ===", total_frames, TEST_SECONDS);
+    ESP_LOGI(TAG, "=== Done: %"PRIu32" frames in %d seconds ===", final, TEST_SECONDS);
     ESP_LOGI(TAG, "Effective rate: %"PRIu32" Hz (target: %d Hz)",
-             total_frames / TEST_SECONDS, SAMPLE_RATE);
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Continuing output for scope inspection...");
+             final / TEST_SECONDS, SAMPLE_RATE);
 
-    /* Keep outputting */
-    while (1) {
-        for (size_t f = 0; f < frames_per_write; f++) {
-            size_t base = f * parlio_frame_size;
-            parlio_buf[base + 0] = ramp_sample(&i2s_phase[0], 440);
-            parlio_buf[base + 1] = ramp_sample(&i2s_phase[1], 880);
-            for (int ch = 0; ch < 8; ch++)
-                parlio_buf[base + 2 + ch] = ramp_sample(&adat_phase[ch], 200 + ch * 100);
-        }
-        parlio_audio_tx_write(tx, parlio_buf, frames_per_write, NULL, 1000);
-
-        if (i2s_hw) {
-            for (size_t f = 0; f < frames_per_write; f++) {
-                hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
-                hw_buf[f * 2 + 1] = ramp_sample(&hw_phase[1], 1500);
-            }
-            size_t bw = 0;
-            i2s_channel_write(i2s_hw, hw_buf,
-                              frames_per_write * 2 * sizeof(int32_t), &bw, 1000);
-        }
+    float pct = 100.0f * (float)(final / TEST_SECONDS) / (float)SAMPLE_RATE;
+    if (pct >= 99.0f) {
+        ESP_LOGI(TAG, "PASS -- sustained real-time output at %.1f%% of target", pct);
+    } else {
+        ESP_LOGW(TAG, "UNDERRUN -- achieved %.1f%% of target rate", pct);
     }
+
+    ESP_LOGI(TAG, "Continuing output for scope inspection...");
+    ctx.running = true;
+    xTaskCreatePinnedToCore(audio_task, "audio_cont", 8192, &ctx,
+                            configMAX_PRIORITIES - 1, NULL, 1);
+    while (1) { vTaskDelay(pdMS_TO_TICKS(10000)); }
 }

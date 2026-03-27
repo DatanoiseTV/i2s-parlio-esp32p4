@@ -73,11 +73,13 @@ struct parlio_audio_tx {
     spdif_state_t *spdif;
     adat_state_t  *adat;
 
-    /* Pre-computed per-tick lookup tables (eliminates divisions in hot path).
+    /* Pre-computed per-tick lookup tables (eliminates ALL divisions in hot path).
      * Allocated once during init, ticks_per_frame entries each. */
     uint16_t *tick_static_mask;  /* BCLK + LRCK bits for each tick (constant every frame) */
     uint8_t  *tick_slot;         /* which slot (channel) this tick belongs to */
     int8_t   *tick_bit_idx;      /* audio bit index within the slot (-1 = no data) */
+    uint16_t *tick_spdif_ui;     /* SPDIF unit interval index for each tick */
+    uint16_t *tick_adat_bi;      /* ADAT bit index for each tick */
 
     /* Sample layout */
     size_t samples_per_frame;
@@ -151,7 +153,7 @@ static inline uint8_t bmc_preamble(uint8_t *buf, size_t *ui,
     return (p >> 7) & 1;
 }
 
-static void encode_spdif_raw(spdif_state_t *s, uint8_t *out,
+static void IRAM_ATTR encode_spdif_raw(spdif_state_t *s, uint8_t *out,
                                int32_t left, int32_t right)
 {
     memset(out, 0, 16);
@@ -200,7 +202,7 @@ static inline void nrzi_bit(uint8_t *buf, size_t *idx, uint8_t bit, uint8_t *st)
     (*idx)++;
 }
 
-static void encode_adat_raw(adat_state_t *s, uint8_t *out,
+static void IRAM_ATTR encode_adat_raw(adat_state_t *s, uint8_t *out,
                               const int32_t *samples)
 {
     memset(out, 0, 32);
@@ -242,6 +244,8 @@ static void build_tick_tables(struct parlio_audio_tx *h)
     h->tick_static_mask = calloc(tpf, sizeof(uint16_t));
     h->tick_slot        = calloc(tpf, sizeof(uint8_t));
     h->tick_bit_idx     = malloc(tpf * sizeof(int8_t));
+    h->tick_spdif_ui    = calloc(tpf, sizeof(uint16_t));
+    h->tick_adat_bi     = calloc(tpf, sizeof(uint16_t));
     if (!h->tick_static_mask || !h->tick_slot || !h->tick_bit_idx) return;
 
     memset(h->tick_bit_idx, -1, tpf);
@@ -257,13 +261,11 @@ static void build_tick_tables(struct parlio_audio_tx *h)
             uint16_t bclk_idx = tick / tpb;
             uint16_t sub_tick = tick % tpb;
 
-            /* BCLK */
             if (!is->bclk_on_clk_out) {
                 if (sub_tick < tpb / 2)
                     mask |= (1 << is->bclk_bit);
             }
 
-            /* LRCK */
             slot = bclk_idx / is->slot_width;
             if (is->mode == PARLIO_AUDIO_I2S_STANDARD) {
                 if (slot >= 1) mask |= (1 << is->lrck_bit);
@@ -271,7 +273,6 @@ static void build_tick_tables(struct parlio_audio_tx *h)
                 if (bclk_idx == 0) mask |= (1 << is->lrck_bit);
             }
 
-            /* Bit index */
             uint16_t pos_in_slot = bclk_idx % is->slot_width;
             int16_t bi = (int16_t)pos_in_slot - 1;
             if (bi >= 0 && bi < is->bits_per_sample)
@@ -281,6 +282,12 @@ static void build_tick_tables(struct parlio_audio_tx *h)
         h->tick_static_mask[tick] = mask;
         h->tick_slot[tick] = slot;
         h->tick_bit_idx[tick] = bit_idx;
+
+        /* Pre-compute SPDIF/ADAT bit indices (eliminates runtime divisions) */
+        if (h->spdif)
+            h->tick_spdif_ui[tick] = tick / h->spdif->ticks_per_ui;
+        if (h->adat)
+            h->tick_adat_bi[tick] = tick / h->adat->ticks_per_bit;
     }
 }
 
@@ -323,39 +330,45 @@ static void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
         i2s_dsb = h->i2s->data_start_bit;
     }
 
-    /* SPDIF/ADAT bit positions and tick ratios */
-    uint8_t spdif_dbit = h->spdif ? h->spdif->data_bit : 0;
-    uint16_t spdif_tpu = h->spdif ? h->spdif->ticks_per_ui : 1;
-    uint8_t adat_dbit  = h->adat ? h->adat->data_bit : 0;
-    uint16_t adat_tpb  = h->adat ? h->adat->ticks_per_bit : 1;
+    /* Cache protocol bit positions */
+    const uint8_t spdif_dbit = h->spdif ? h->spdif->data_bit : 0;
+    const uint8_t adat_dbit  = h->adat  ? h->adat->data_bit  : 0;
+    const uint16_t *spdif_ui_lut = h->tick_spdif_ui;
+    const uint16_t *adat_bi_lut  = h->tick_adat_bi;
+    const bool has_spdif = (h->spdif != NULL);
+    const bool has_adat  = (h->adat  != NULL);
 
-    /* Compose each PARLIO tick using lookup tables (no divisions) */
+    /* Compose each PARLIO tick using lookup tables (zero divisions) */
     for (uint16_t tick = 0; tick < tpf; tick++) {
-        uint16_t word = static_mask[tick]; /* BCLK + LRCK pre-computed */
+        uint16_t word = static_mask[tick];
 
-        /* I2S data bits (only when bit_idx >= 0) */
+        /* I2S data bits */
         int8_t bi = bidx_lut[tick];
         if (bi >= 0 && i2s_samp) {
             uint8_t sl = slot_lut[tick];
-            int shift = 31 - bi;
+            uint32_t shift = 31 - (uint32_t)bi;
             for (uint8_t line = 0; line < i2s_ndl; line++) {
-                word |= (uint16_t)(((uint32_t)i2s_samp[line * i2s_ns + sl] >> shift) & 1) << (i2s_dsb + line);
+                word |= (uint16_t)((i2s_samp[line * i2s_ns + sl] >> shift) & 1) << (i2s_dsb + line);
             }
         }
 
-        /* S/PDIF: read from pre-encoded bit buffer */
-        if (h->spdif) {
-            uint16_t ui = tick / spdif_tpu;
+        /* S/PDIF: index from pre-computed table */
+        if (has_spdif) {
+            uint16_t ui = spdif_ui_lut[tick];
             word |= (uint16_t)((spdif_bits[ui >> 3] >> (ui & 7)) & 1) << spdif_dbit;
         }
 
-        /* ADAT: read from pre-encoded bit buffer */
-        if (h->adat) {
-            uint16_t bi_a = tick / adat_tpb;
-            word |= (uint16_t)((adat_bits[bi_a >> 3] >> (bi_a & 7)) & 1) << adat_dbit;
+        /* ADAT: index from pre-computed table */
+        if (has_adat) {
+            uint16_t ai = adat_bi_lut[tick];
+            word |= (uint16_t)((adat_bits[ai >> 3] >> (ai & 7)) & 1) << adat_dbit;
         }
 
-        write_parlio_word(dst, tick, word, pw);
+        if (pw <= 8) {
+            dst[tick] = (uint8_t)word;
+        } else {
+            ((uint16_t *)dst)[tick] = word;
+        }
     }
 }
 
@@ -837,6 +850,8 @@ esp_err_t parlio_audio_tx_delete(parlio_audio_tx_handle_t handle)
     free(handle->tick_static_mask);
     free(handle->tick_slot);
     free(handle->tick_bit_idx);
+    free(handle->tick_spdif_ui);
+    free(handle->tick_adat_bi);
     free(handle->i2s);
     free(handle->spdif);
     free(handle->adat);
