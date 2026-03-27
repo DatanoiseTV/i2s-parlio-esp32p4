@@ -10,6 +10,7 @@
 #include "driver/gpio.h"
 #include "driver/parlio_tx.h"
 #include "esp_ldo_regulator.h"
+#include "esp_timer.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/parlio_periph.h"
 
@@ -144,9 +145,9 @@ void app_main(void)
              tx_buf[8], tx_buf[9], tx_buf[10], tx_buf[11],
              tx_buf[12], tx_buf[13], tx_buf[14], tx_buf[15]);
 
-    /* --- Transmit and sample GPIOs to verify output --- */
+    /* --- 30-second continuous test with periodic GPIO sampling --- */
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "=== Transmitting and sampling GPIO states ===");
+    ESP_LOGI(TAG, "=== Running 30-second continuous output test ===");
 
     /* Enable GPIO input on the output pins for readback */
     gpio_set_direction(PIN_BCLK, GPIO_MODE_INPUT);
@@ -158,99 +159,105 @@ void app_main(void)
     esp_rom_gpio_connect_out_signal(PIN_LRCK, PARLIO_TX_DATA0_PAD_OUT_IDX, false, false);
     esp_rom_gpio_connect_out_signal(PIN_DATA, PARLIO_TX_DATA1_PAD_OUT_IDX, false, false);
 
-    /* Sample GPIO states during transmission.
-     * At 3.072 MHz BCLK, each cycle is ~325 ns. CPU at 360 MHz can sample
-     * ~117 cycles per BCLK, so we'll catch plenty of transitions. */
+    parlio_transmit_config_t tcfg = { .idle_value = 0 };
+    const int test_duration_sec = 30;
+    const int sample_interval_sec = 5;
+    uint32_t total_bursts = 0;
+    uint32_t total_bclk_transitions = 0;
+    uint32_t total_lrck_transitions = 0;
+    uint32_t total_data_transitions = 0;
+    uint32_t sample_rounds = 0;
+
+    int64_t start_time = esp_timer_get_time();
+    int64_t next_sample_time = start_time;
+    int64_t end_time = start_time + (int64_t)test_duration_sec * 1000000;
 
     #define NUM_SAMPLES 256
-    uint8_t bclk_samples[NUM_SAMPLES];
-    uint8_t lrck_samples[NUM_SAMPLES];
-    uint8_t data_samples[NUM_SAMPLES];
 
-    /* Start transmission */
-    parlio_transmit_config_t tcfg = { .idle_value = 0 };
-    ESP_ERROR_CHECK(parlio_tx_unit_transmit(parlio, tx_buf, total_bclk * 2, &tcfg));
+    while (esp_timer_get_time() < end_time) {
+        /* Transmit the test pattern */
+        ESP_ERROR_CHECK(parlio_tx_unit_transmit(parlio, tx_buf, total_bclk * 2, &tcfg));
+        total_bursts++;
 
-    /* Tight sampling loop using gpio_get_level.
-     * At 360 MHz CPU vs 3 MHz BCLK, each BCLK cycle is ~120 CPU cycles.
-     * With the delay we sample roughly every 2-3 BCLK cycles. */
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        bclk_samples[i] = gpio_get_level(PIN_BCLK);
-        lrck_samples[i] = gpio_get_level(PIN_LRCK);
-        data_samples[i] = gpio_get_level(PIN_DATA);
-        for (volatile int d = 0; d < 30; d++) {}
-    }
-
-    parlio_tx_unit_wait_all_done(parlio, 1000);
-
-    /* Print sampled GPIO states */
-    ESP_LOGI(TAG, "GPIO samples (B=BCLK, L=LRCK, D=DATA):");
-    for (int row = 0; row < NUM_SAMPLES / 32; row++) {
-        char line[200];
-        int pos = 0;
-        pos += snprintf(line + pos, sizeof(line) - pos, "  B: ");
-        for (int i = 0; i < 32; i++)
-            pos += snprintf(line + pos, sizeof(line) - pos, "%d", bclk_samples[row * 32 + i]);
-        ESP_LOGI(TAG, "%s", line);
-
-        pos = 0;
-        pos += snprintf(line + pos, sizeof(line) - pos, "  L: ");
-        for (int i = 0; i < 32; i++)
-            pos += snprintf(line + pos, sizeof(line) - pos, "%d", lrck_samples[row * 32 + i]);
-        ESP_LOGI(TAG, "%s", line);
-
-        pos = 0;
-        pos += snprintf(line + pos, sizeof(line) - pos, "  D: ");
-        for (int i = 0; i < 32; i++)
-            pos += snprintf(line + pos, sizeof(line) - pos, "%d", data_samples[row * 32 + i]);
-        ESP_LOGI(TAG, "%s", line);
-        ESP_LOGI(TAG, "");
-    }
-
-    /* Count transitions */
-    int bclk_transitions = 0, lrck_transitions = 0, data_transitions = 0;
-    for (int i = 1; i < NUM_SAMPLES; i++) {
-        if (bclk_samples[i] != bclk_samples[i-1]) bclk_transitions++;
-        if (lrck_samples[i] != lrck_samples[i-1]) lrck_transitions++;
-        if (data_samples[i] != data_samples[i-1]) data_transitions++;
-    }
-    ESP_LOGI(TAG, "Transitions in %d samples: BCLK=%d, LRCK=%d, DATA=%d",
-             NUM_SAMPLES, bclk_transitions, lrck_transitions, data_transitions);
-
-    if (bclk_transitions > 10 && lrck_transitions > 0 && data_transitions > 0) {
-        ESP_LOGI(TAG, "PASS -- all signals toggling");
-    } else if (bclk_transitions > 10 && lrck_transitions > 0) {
-        ESP_LOGW(TAG, "PARTIAL -- BCLK and LRCK active, DATA not toggling");
-    } else if (bclk_transitions > 10) {
-        ESP_LOGW(TAG, "PARTIAL -- only BCLK active");
-    } else {
-        ESP_LOGE(TAG, "FAIL -- no signal activity (check wire GPIO %d -> %d)",
-                 PIN_MCLK_OUT, PIN_PARLIO_CLK);
-    }
-
-    /* Keep transmitting for scope/analyzer inspection */
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Now looping continuous output for scope/analyzer verification...");
-    while (1) {
-        memset(tx_buf, 0, buf_bytes);
-        for (size_t f = 0; f < num_test_frames; f++) {
-            int32_t left  = (f % 2 == 0) ? (int32_t)0x80000000 : (int32_t)0x7FFFFFFF;
-            int32_t right = (f % 2 == 0) ? (int32_t)0x7FFFFFFF : (int32_t)0x80000000;
-            for (uint16_t bclk = 0; bclk < bclk_per_frame; bclk++) {
-                uint8_t slot = bclk / SLOT_WIDTH;
-                uint16_t pos = bclk % SLOT_WIDTH;
-                int16_t bit_idx = (int16_t)pos - 1;
-                uint8_t lrck = (slot >= 1) ? 1 : 0;
-                uint8_t data_bit = 0;
-                if (bit_idx >= 0 && bit_idx < BITS) {
-                    int32_t samp = (slot == 0) ? left : right;
-                    data_bit = (samp >> (31 - bit_idx)) & 1;
-                }
-                uint8_t word = (lrck & 1) | ((data_bit & 1) << 1);
-                size_t idx = f * bclk_per_frame + bclk;
-                tx_buf[idx / 4] |= (word & 0x03) << ((idx % 4) * 2);
+        /* Periodically sample GPIO states during active transmission */
+        int64_t now = esp_timer_get_time();
+        if (now >= next_sample_time) {
+            uint8_t bclk_s[NUM_SAMPLES], lrck_s[NUM_SAMPLES], data_s[NUM_SAMPLES];
+            for (int i = 0; i < NUM_SAMPLES; i++) {
+                bclk_s[i] = gpio_get_level(PIN_BCLK);
+                lrck_s[i] = gpio_get_level(PIN_LRCK);
+                data_s[i] = gpio_get_level(PIN_DATA);
+                for (volatile int d = 0; d < 30; d++) {}
             }
+
+            int bt = 0, lt = 0, dt = 0;
+            for (int i = 1; i < NUM_SAMPLES; i++) {
+                if (bclk_s[i] != bclk_s[i-1]) bt++;
+                if (lrck_s[i] != lrck_s[i-1]) lt++;
+                if (data_s[i] != data_s[i-1]) dt++;
+            }
+
+            total_bclk_transitions += bt;
+            total_lrck_transitions += lt;
+            total_data_transitions += dt;
+            sample_rounds++;
+
+            int elapsed = (int)((now - start_time) / 1000000);
+            ESP_LOGI(TAG, "[%2ds] bursts=%"PRIu32" | BCLK=%d LRCK=%d DATA=%d transitions",
+                     elapsed, total_bursts, bt, lt, dt);
+
+            /* Print one row of waveform on first and last sample */
+            if (sample_rounds == 1 || now + (int64_t)sample_interval_sec * 1000000 >= end_time) {
+                char line[200];
+                int pos = 0;
+                pos += snprintf(line + pos, sizeof(line) - pos, "  B:");
+                for (int i = 0; i < 64; i++) pos += snprintf(line + pos, sizeof(line) - pos, "%d", bclk_s[i]);
+                ESP_LOGI(TAG, "%s", line);
+                pos = 0;
+                pos += snprintf(line + pos, sizeof(line) - pos, "  L:");
+                for (int i = 0; i < 64; i++) pos += snprintf(line + pos, sizeof(line) - pos, "%d", lrck_s[i]);
+                ESP_LOGI(TAG, "%s", line);
+                pos = 0;
+                pos += snprintf(line + pos, sizeof(line) - pos, "  D:");
+                for (int i = 0; i < 64; i++) pos += snprintf(line + pos, sizeof(line) - pos, "%d", data_s[i]);
+                ESP_LOGI(TAG, "%s", line);
+            }
+
+            next_sample_time = now + (int64_t)sample_interval_sec * 1000000;
         }
+
+        parlio_tx_unit_wait_all_done(parlio, 1000);
+    }
+
+    /* --- Final report --- */
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== RESULTS after %d seconds ===", test_duration_sec);
+    ESP_LOGI(TAG, "Total bursts transmitted: %"PRIu32, total_bursts);
+    ESP_LOGI(TAG, "GPIO sample rounds: %"PRIu32, sample_rounds);
+    ESP_LOGI(TAG, "Total transitions: BCLK=%"PRIu32" LRCK=%"PRIu32" DATA=%"PRIu32,
+             total_bclk_transitions, total_lrck_transitions, total_data_transitions);
+
+    bool pass = true;
+    if (total_bclk_transitions < sample_rounds * 10) {
+        ESP_LOGE(TAG, "FAIL: BCLK not toggling consistently");
+        pass = false;
+    }
+    if (total_lrck_transitions < sample_rounds) {
+        ESP_LOGE(TAG, "FAIL: LRCK not toggling consistently");
+        pass = false;
+    }
+    if (total_data_transitions < sample_rounds) {
+        ESP_LOGE(TAG, "FAIL: DATA not toggling consistently");
+        pass = false;
+    }
+    if (pass) {
+        ESP_LOGI(TAG, "PASS -- all signals active for %d seconds, %"PRIu32" bursts without error",
+                 test_duration_sec, total_bursts);
+    }
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Continuing output for scope inspection (ctrl+c to stop)...");
+    while (1) {
         parlio_tx_unit_transmit(parlio, tx_buf, total_bclk * 2, &tcfg);
         parlio_tx_unit_wait_all_done(parlio, 1000);
     }
