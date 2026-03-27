@@ -1,6 +1,11 @@
-# PARLIO I2S/TDM Transmitter for ESP32-P4
+# PARLIO Audio Transmitter for ESP32-P4
 
-Multi-channel I2S/TDM transmitter that abuses the Parallel IO peripheral on the ESP32-P4 to synthesize I2S output signals (MCLK, BCLK, LRCK/FSYNC, variable data lines), clocked by the APLL for sample-accurate audio timing.
+Multi-protocol audio transmitter that abuses the Parallel IO peripheral on the ESP32-P4 to synthesize digital audio output signals, clocked by the APLL for sample-accurate timing.
+
+Supported protocols:
+- **I2S / TDM** -- up to 240 channels (15 data lines x 16 TDM slots), Philips or TDM framing
+- **S/PDIF** -- stereo IEC60958 with biphase mark coding, single wire output
+- **ADAT Lightpipe** -- 8 channels of 24-bit audio with NRZI encoding, single wire output
 
 ## How it works
 
@@ -133,6 +138,55 @@ Generate precisely timed test signals across many channels simultaneously -- use
 
 ### ADAT/SPDIF Bitstream Generation
 With software-defined output and configurable bit rates, you could synthesize ADAT lightpipe or SPDIF bitstreams directly, without dedicated transmitter ICs.
+
+## S/PDIF Transmitter
+
+Single-wire S/PDIF output using biphase mark coding (BMC). Uses PARLIO in 1-bit serial mode at 128 * Fs.
+
+- Stereo, 16/20/24 bit
+- Consumer or professional channel status
+- 192-frame channel status block transmitted cyclically
+- One GPIO pin for the S/PDIF output (directly drives coax or optical transmitter)
+
+```c
+parlio_spdif_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .bits_per_sample = 24,
+    .mclk_multiple = 256,
+    .mclk_gpio = GPIO_NUM_20,
+    .spdif_gpio = GPIO_NUM_22,
+    .consumer_format = true,
+};
+parlio_spdif_tx_handle_t spdif;
+parlio_spdif_tx_new(&cfg, &spdif);
+parlio_spdif_tx_enable(spdif);
+
+int32_t stereo[2] = { left_sample, right_sample };
+parlio_spdif_tx_write(spdif, stereo, 1, NULL, 1000);
+```
+
+## ADAT Lightpipe Transmitter
+
+8-channel ADAT output using NRZI encoding. Uses PARLIO in 1-bit serial mode at 256 * Fs.
+
+- 8 channels, 24-bit, 48 kHz (standard ADAT)
+- One GPIO pin for the ADAT output (drives TOTX173/177 optical transmitter or coax)
+- Frame includes sync pattern, nibble separators, and per-channel user bits
+
+```c
+parlio_adat_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .mclk_multiple = 512,
+    .mclk_gpio = GPIO_NUM_20,
+    .adat_gpio = GPIO_NUM_22,
+};
+parlio_adat_tx_handle_t adat;
+parlio_adat_tx_new(&cfg, &adat);
+parlio_adat_tx_enable(adat);
+
+int32_t frame[8] = { ch0, ch1, ch2, ch3, ch4, ch5, ch6, ch7 };
+parlio_adat_tx_write(adat, frame, 1, NULL, 1000);
+```
 
 ## Build
 
