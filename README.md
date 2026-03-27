@@ -83,6 +83,25 @@ Typical MCLK multiples: 256x (standard/TDM4), 512x (TDM8), 1024x (TDM16).
 - Format: I2S Philips (standard) or TDM with 1-BCLK frame sync
 - All channels share MCLK/BCLK/LRCK -- zero inter-channel clock drift
 
+## Latency
+
+The output latency is determined by the DMA buffer pipeline:
+
+```
+Latency = frames_per_buffer * dma_buffer_count / sample_rate
+```
+
+| frames_per_buffer | dma_buffer_count | Latency @ 48 kHz |
+|-------------------|-----------------|-------------------|
+| 64 | 4 | 5.3 ms |
+| 128 | 4 | 10.7 ms |
+| 32 | 3 | 2.0 ms |
+| 16 | 2 | 0.67 ms |
+
+The minimum practical latency depends on how fast your application can fill DMA buffers. With smaller buffers, the CPU has less time to prepare the next chunk before an underrun occurs. For real-time audio processing at 48 kHz, 2-4 ms (32-64 frames, 2-4 buffers) is a reasonable target.
+
+There is no additional latency from clock synchronization -- BCLK, LRCK, and all data lines are output from the same PARLIO clock domain in the same DMA cycle, so all signals are phase-aligned to within a single MCLK period (< 100 ns at typical audio rates).
+
 ## GPIO Wiring
 
 | Signal | Default GPIO | PARLIO Function | Description |
