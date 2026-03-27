@@ -14,12 +14,12 @@
 static const char *TAG = "parlio_i2s";
 
 /*
- * Internal representation of one PARLIO-based I2S TX instance.
+ * Internal representation of one PARLIO-based I2S/TDM TX instance.
  *
  * The APLL generates a precise audio master clock. We route it through the I2S
  * peripheral (used only as clock generator) -> MCLK GPIO -> PARLIO ext clock in.
- * PARLIO then outputs MCLK on its clock-out pin, and synthesizes BCLK, LRCK, and
- * data lines as parallel data bits in the DMA buffer.
+ * PARLIO then outputs MCLK on its clock-out pin, and synthesizes BCLK, LRCK/FSYNC,
+ * and data lines as parallel data bits in the DMA buffer.
  */
 struct parlio_i2s_tx {
     /* configuration snapshot */
@@ -27,13 +27,15 @@ struct parlio_i2s_tx {
     uint8_t  bits_per_sample;
     uint8_t  slot_width;
     uint8_t  num_data_lines;
+    uint8_t  num_slots;          /* 2 for standard I2S, 4/8/16 for TDM */
     uint16_t mclk_multiple;
+    parlio_i2s_mode_t mode;
 
     /* derived timing constants */
     uint32_t mclk_freq;          /* MCLK = mclk_multiple * sample_rate */
     uint32_t real_mclk_freq;     /* actual MCLK after APLL rounding */
     uint16_t mclk_per_bclk;     /* MCLK cycles per BCLK period */
-    uint16_t bclk_per_frame;    /* BCLK cycles per audio frame (= slot_width * 2) */
+    uint16_t bclk_per_frame;    /* BCLK cycles per audio frame (= slot_width * num_slots) */
     uint16_t mclk_per_frame;    /* total MCLK cycles per frame */
 
     /* PARLIO data bus width (4, 8, or 16) */
@@ -66,7 +68,18 @@ static uint8_t next_parlio_width(uint8_t needed)
     if (needed <= 4)  return 4;
     if (needed <= 8)  return 8;
     if (needed <= 16) return 16;
-    return 0; /* unsupported */
+    return 0;
+}
+
+/* Write one PARLIO word into the output buffer at the given MCLK index. */
+static inline void write_parlio_word(uint8_t *dst, uint16_t mclk_idx,
+                                      uint16_t word, uint8_t pw)
+{
+    if (pw <= 8) {
+        dst[mclk_idx] = (uint8_t)word;
+    } else {
+        ((uint16_t *)dst)[mclk_idx] = word;
+    }
 }
 
 /*
@@ -75,106 +88,83 @@ static uint8_t next_parlio_width(uint8_t needed)
  * For each MCLK tick within the frame, we produce one parlio_width-bit word.
  * Bit layout:
  *   [0]   = BCLK
- *   [1]   = LRCK
+ *   [1]   = LRCK / frame sync
  *   [2+i] = data line i
  *
- * I2S Philips format:
- *   - LRCK low  = left channel
- *   - LRCK high = right channel
- *   - LRCK transitions one BCLK before the first data bit (the "one-bit offset")
- *   - Data is valid on rising edge of BCLK, MSB first
- *   - Data changes on falling BCLK edge
+ * I2S Philips (STANDARD) format:
+ *   - LRCK low = left channel (slot 0), LRCK high = right channel (slot 1)
+ *   - LRCK transitions one BCLK before the first data bit
+ *   - Data MSB first, changes on falling BCLK, sampled on rising BCLK
+ *
+ * TDM format:
+ *   - Frame sync: 1 BCLK cycle high at the start of each frame
+ *   - Slots packed sequentially: slot0, slot1, ..., slotN
+ *   - Data MSB first, one BCLK offset after frame sync / slot boundary
+ *   - Data changes on falling BCLK, sampled on rising BCLK
  */
 static void encode_frame(struct parlio_i2s_tx *h,
                           uint8_t *dst,
                           const int32_t *samples)
 {
-    const uint16_t mpb  = h->mclk_per_bclk;   /* MCLK ticks per BCLK cycle */
-    const uint16_t bpf  = h->bclk_per_frame;  /* BCLK cycles per frame */
+    const uint16_t mpb  = h->mclk_per_bclk;
+    const uint16_t bpf  = h->bclk_per_frame;
     const uint8_t  sw   = h->slot_width;
     const uint8_t  bps  = h->bits_per_sample;
     const uint8_t  ndl  = h->num_data_lines;
+    const uint8_t  ns   = h->num_slots;
     const uint8_t  pw   = h->parlio_width;
+    const bool     is_std = (h->mode == PARLIO_I2S_MODE_STANDARD);
 
     /*
-     * samples layout (per frame): [L0, R0, L1, R1, ...] as int32_t left-justified.
-     * If samples is NULL, output silence (all data bits zero).
+     * Sample layout per frame:
+     *   [line0_slot0, line0_slot1, ..., line0_slotN-1,
+     *    line1_slot0, line1_slot1, ..., line1_slotN-1, ...]
+     * Each sample is left-justified int32_t. NULL means silence.
      */
 
     uint16_t mclk_idx = 0;
     for (uint16_t bclk = 0; bclk < bpf; bclk++) {
-        /*
-         * Determine the channel (left/right) and bit index.
-         * In Philips I2S, LRCK transitions one BCLK before the MSB.
-         *
-         * bclk 0..sw-1   -> left slot  (LRCK=0 from bclk 0)
-         * bclk sw..2*sw-1 -> right slot (LRCK=1 from bclk sw)
-         *
-         * But Philips has a one-cycle offset: LRCK changes one BCLK early.
-         * So LRCK goes low at bclk = (2*sw - 1) for next frame's left,
-         * and goes high at bclk = (sw - 1) for right.
-         *
-         * Simpler: LRCK transitions at bclk = sw-1 (rising) and 2*sw-1 (falling).
-         * We encode LRCK as: (bclk >= sw) for the current frame, with the
-         * understanding that the one-bit offset is handled by shifting the data
-         * start by one BCLK cycle.
-         */
+        /* Determine which slot this BCLK cycle belongs to */
+        uint8_t slot = bclk / sw;
+        uint16_t pos_in_slot = bclk % sw; /* position within the slot */
 
-        /* LRCK for Philips: transitions one BCLK before data MSB */
+        /* --- LRCK / frame sync --- */
         uint8_t lrck;
-        if (bclk == 0) {
-            /* first BCLK of frame: LRCK went low on previous frame's last BCLK */
-            lrck = 0;
-        } else if (bclk < sw) {
-            lrck = 0;
+        if (is_std) {
+            /* Philips: LRCK low for slot 0 (left), high for slot 1 (right).
+             * LRCK transitions occur one BCLK before the slot boundary. */
+            lrck = (slot >= 1) ? 1 : 0;
         } else {
-            lrck = 1;
+            /* TDM: frame sync pulse high for one BCLK at frame start */
+            lrck = (bclk == 0) ? 1 : 0;
         }
 
-        /* Which channel and which bit of the sample are we outputting? */
-        uint8_t  channel;      /* 0 = left, 1 = right */
-        int16_t  bit_idx;      /* bit position within the sample, counting from MSB=0 */
+        /* --- Data bit index within the current slot's sample ---
+         * Philips/TDM both use a one-BCLK offset: MSB appears on the
+         * second BCLK of each slot, so bit_idx = pos_in_slot - 1. */
+        int16_t bit_idx = (int16_t)pos_in_slot - 1;
 
-        if (bclk < sw) {
-            channel = 0;
-            /* Philips offset: data MSB appears on the second BCLK after LRCK transition */
-            bit_idx = (int16_t)bclk - 1;
-        } else {
-            channel = 1;
-            bit_idx = (int16_t)(bclk - sw) - 1;
-        }
-
-        /* Build the data bits for all lines */
+        /* Build the data bits for all lines in parallel */
         uint16_t data_bits = 0;
-        for (uint8_t line = 0; line < ndl; line++) {
-            uint8_t bit_val = 0;
-            if (bit_idx >= 0 && bit_idx < bps && samples != NULL) {
-                /* samples are left-justified int32_t, MSB at bit 31 */
-                int32_t samp = samples[line * 2 + channel];
-                bit_val = (samp >> (31 - bit_idx)) & 1;
+        if (bit_idx >= 0 && bit_idx < bps && samples != NULL) {
+            for (uint8_t line = 0; line < ndl; line++) {
+                int32_t samp = samples[line * ns + slot];
+                uint8_t bit_val = (samp >> (31 - bit_idx)) & 1;
+                data_bits |= (bit_val << line);
             }
-            data_bits |= (bit_val << line);
         }
 
-        /* For each MCLK sub-tick within this BCLK cycle, output the word.
-         * BCLK is high for the first half, low for the second half.
-         * Data changes on the falling edge of BCLK (beginning of low phase). */
+        /* Expand each BCLK cycle into mclk_per_bclk MCLK ticks.
+         * BCLK high for the first half, low for the second half. */
         for (uint16_t m = 0; m < mpb; m++, mclk_idx++) {
             uint8_t bclk_val = (m < (mpb / 2)) ? 1 : 0;
 
             uint16_t word = 0;
             word |= (bclk_val & 1) << 0;
             word |= (lrck & 1)     << 1;
-            word |= (data_bits)    << 2;
+            word |= data_bits      << 2;
 
-            /* Pack into the output buffer according to parlio_width */
-            if (pw <= 8) {
-                dst[mclk_idx] = (uint8_t)word;
-            } else {
-                /* 16-bit mode: little-endian */
-                uint16_t *dst16 = (uint16_t *)dst;
-                dst16[mclk_idx] = word;
-            }
+            write_parlio_word(dst, mclk_idx, word, pw);
         }
     }
 }
@@ -197,7 +187,6 @@ static bool IRAM_ATTR on_parlio_tx_done(parlio_tx_unit_handle_t tx_unit,
 static esp_err_t setup_apll_clock(struct parlio_i2s_tx *h,
                                    gpio_num_t apll_feed_gpio)
 {
-    /* Allocate an I2S TX channel -- we will never write audio data to it */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 2;
     chan_cfg.dma_frame_num = 16;
@@ -205,7 +194,6 @@ static esp_err_t setup_apll_clock(struct parlio_i2s_tx *h,
         i2s_new_channel(&chan_cfg, &h->i2s_clk_chan, NULL),
         TAG, "failed to allocate I2S channel for APLL clock");
 
-    /* Configure STD mode with APLL clock source */
     i2s_std_config_t std_cfg = {
         .clk_cfg = {
             .sample_rate_hz = h->sample_rate,
@@ -226,7 +214,6 @@ static esp_err_t setup_apll_clock(struct parlio_i2s_tx *h,
         i2s_channel_init_std_mode(h->i2s_clk_chan, &std_cfg),
         TAG, "failed to init I2S STD mode for APLL clock");
 
-    /* Enable the channel to start MCLK output */
     ESP_RETURN_ON_ERROR(
         i2s_channel_enable(h->i2s_clk_chan),
         TAG, "failed to enable I2S clock channel");
@@ -243,13 +230,13 @@ static esp_err_t setup_parlio(struct parlio_i2s_tx *h,
                                const parlio_i2s_tx_config_t *cfg)
 {
     parlio_tx_unit_config_t parlio_cfg = {
-        .clk_src = PARLIO_CLK_SRC_DEFAULT,        /* overridden by clk_in_gpio_num */
-        .clk_in_gpio_num = cfg->apll_feed_gpio,   /* external clock from APLL via I2S */
+        .clk_src = PARLIO_CLK_SRC_DEFAULT,
+        .clk_in_gpio_num = cfg->apll_feed_gpio,
         .input_clk_src_freq_hz = h->mclk_freq,
-        .output_clk_freq_hz = h->mclk_freq,       /* 1:1 passthrough, no division */
+        .output_clk_freq_hz = h->mclk_freq,
         .data_width = h->parlio_width,
-        .clk_out_gpio_num = cfg->mclk_gpio,       /* MCLK output to the DAC */
-        .valid_gpio_num = -1,                      /* not used */
+        .clk_out_gpio_num = cfg->mclk_gpio,
+        .valid_gpio_num = -1,
         .trans_queue_depth = cfg->dma_buffer_count,
         .max_transfer_size = h->dma_buf_bytes,
         .dma_burst_size = 0,
@@ -261,7 +248,6 @@ static esp_err_t setup_parlio(struct parlio_i2s_tx *h,
         },
     };
 
-    /* Assign GPIO pins: bit 0 = BCLK, bit 1 = LRCK, bit 2+ = data lines */
     for (int i = 0; i < 16; i++) {
         parlio_cfg.data_gpio_nums[i] = -1;
     }
@@ -275,7 +261,6 @@ static esp_err_t setup_parlio(struct parlio_i2s_tx *h,
         parlio_new_tx_unit(&parlio_cfg, &h->parlio_unit),
         TAG, "failed to create PARLIO TX unit");
 
-    /* Register TX-done callback for flow control */
     parlio_tx_event_callbacks_t cbs = {
         .on_trans_done = on_parlio_tx_done,
     };
@@ -283,10 +268,25 @@ static esp_err_t setup_parlio(struct parlio_i2s_tx *h,
         parlio_tx_unit_register_event_callbacks(h->parlio_unit, &cbs, h),
         TAG, "failed to register PARLIO callbacks");
 
-    ESP_LOGI(TAG, "PARLIO TX: width=%u, MCLK=%"PRIu32" Hz, BCLK=%"PRIu32" Hz",
+    ESP_LOGI(TAG, "PARLIO TX: width=%u, MCLK=%"PRIu32" Hz, BCLK=%"PRIu32" Hz, "
+             "%u slots/line, %u data lines, %u total channels",
              h->parlio_width, h->mclk_freq,
-             h->mclk_freq / h->mclk_per_bclk);
+             h->mclk_freq / h->mclk_per_bclk,
+             h->num_slots, h->num_data_lines,
+             h->num_slots * h->num_data_lines);
     return ESP_OK;
+}
+
+/* Validate and resolve mode enum to slot count. Returns 0 on invalid input. */
+static uint8_t resolve_num_slots(parlio_i2s_mode_t mode)
+{
+    switch (mode) {
+    case PARLIO_I2S_MODE_STANDARD: return 2;
+    case PARLIO_I2S_MODE_TDM4:    return 4;
+    case PARLIO_I2S_MODE_TDM8:    return 8;
+    case PARLIO_I2S_MODE_TDM16:   return 16;
+    default:                       return 0;
+    }
 }
 
 /* --- public API --- */
@@ -303,8 +303,15 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
                         config->bits_per_sample == 32,
                         ESP_ERR_INVALID_ARG, TAG, "unsupported bits_per_sample");
 
+    /* Resolve mode -- default to standard I2S if zero / unset */
+    parlio_i2s_mode_t mode = config->mode;
+    if (mode == 0) mode = PARLIO_I2S_MODE_STANDARD;
+    uint8_t num_slots = resolve_num_slots(mode);
+    ESP_RETURN_ON_FALSE(num_slots > 0, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid mode, use STANDARD/TDM4/TDM8/TDM16");
+
     uint8_t slot_w = config->slot_width;
-    if (slot_w == 0) slot_w = 32; /* default */
+    if (slot_w == 0) slot_w = 32;
     ESP_RETURN_ON_FALSE(slot_w >= config->bits_per_sample,
                         ESP_ERR_INVALID_ARG, TAG, "slot_width < bits_per_sample");
 
@@ -312,7 +319,7 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     if (mclk_mult == 0) mclk_mult = 256;
 
     /* Compute PARLIO bus width needed */
-    uint8_t needed_bits = 2 + config->num_data_lines; /* BCLK + LRCK + data */
+    uint8_t needed_bits = 2 + config->num_data_lines;
     uint8_t pw = next_parlio_width(needed_bits);
     ESP_RETURN_ON_FALSE(pw > 0 && pw <= 16, ESP_ERR_INVALID_ARG, TAG,
                         "too many data lines for PARLIO");
@@ -325,19 +332,29 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     h->bits_per_sample = config->bits_per_sample;
     h->slot_width     = slot_w;
     h->num_data_lines = config->num_data_lines;
+    h->num_slots      = num_slots;
     h->mclk_multiple  = mclk_mult;
+    h->mode           = mode;
     h->parlio_width   = pw;
 
-    /* Timing calculations */
+    /* Timing calculations.
+     * bclk_per_frame = slot_width * num_slots
+     *   Standard: 32 * 2 = 64
+     *   TDM8:     32 * 8 = 256
+     *   TDM16:    32 * 16 = 512
+     * mclk_per_bclk = mclk_multiple / bclk_per_frame (must be >= 2) */
+    h->bclk_per_frame = (uint16_t)(slot_w * num_slots);
     h->mclk_freq      = (uint32_t)mclk_mult * config->sample_rate;
-    h->bclk_per_frame = (uint16_t)(slot_w * 2);
     h->mclk_per_bclk  = mclk_mult / h->bclk_per_frame;
     h->mclk_per_frame = (uint16_t)(h->mclk_per_bclk * h->bclk_per_frame);
 
     ESP_RETURN_ON_FALSE(h->mclk_per_bclk >= 2, ESP_ERR_INVALID_ARG, TAG,
-                        "MCLK/BCLK ratio too low (< 2), increase mclk_multiple");
+                        "MCLK/BCLK ratio too low (< 2), increase mclk_multiple "
+                        "(need >= %u for %u slots x %u-bit)",
+                        (unsigned)(h->bclk_per_frame * 2), num_slots, slot_w);
     ESP_RETURN_ON_FALSE((mclk_mult % h->bclk_per_frame) == 0, ESP_ERR_INVALID_ARG, TAG,
-                        "mclk_multiple must be divisible by (slot_width * 2)");
+                        "mclk_multiple (%u) must be divisible by slot_width*num_slots (%u)",
+                        mclk_mult, h->bclk_per_frame);
 
     /* DMA buffer sizing */
     h->frames_per_buf = config->frames_per_buffer ? config->frames_per_buffer : 128;
@@ -347,12 +364,17 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     h->frame_buf_bytes = h->mclk_per_frame * bytes_per_mclk_tick;
     h->dma_buf_bytes   = h->frame_buf_bytes * h->frames_per_buf;
 
-    ESP_LOGI(TAG, "frame_buf=%u B, dma_buf=%u B x %u, total=%u B",
+    ESP_LOGI(TAG, "mode=%s, %u slots/line, %u lines, %u total ch, "
+             "frame_buf=%u B, dma_buf=%u B x %u",
+             (mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
+             (mode == PARLIO_I2S_MODE_TDM4) ? "TDM4" :
+             (mode == PARLIO_I2S_MODE_TDM8) ? "TDM8" : "TDM16",
+             num_slots, config->num_data_lines,
+             (unsigned)(num_slots * config->num_data_lines),
              (unsigned)h->frame_buf_bytes, (unsigned)h->dma_buf_bytes,
-             (unsigned)h->dma_buf_count,
-             (unsigned)(h->dma_buf_bytes * h->dma_buf_count));
+             (unsigned)h->dma_buf_count);
 
-    /* Allocate DMA buffers in internal memory (DMA-capable) */
+    /* Allocate DMA buffers */
     h->dma_bufs = calloc(h->dma_buf_count, sizeof(uint8_t *));
     ESP_GOTO_ON_FALSE(h->dma_bufs, ESP_ERR_NO_MEM, fail, TAG, "alloc buf array");
 
@@ -395,10 +417,9 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
     handle->write_buf_idx = 0;
     handle->write_frame_pos = 0;
 
-    /* Pre-fill all buffers with silence and queue them */
+    /* Pre-fill all buffers with silence (clocks still toggle correctly) */
     for (size_t i = 0; i < handle->dma_buf_count; i++) {
         memset(handle->dma_bufs[i], 0, handle->dma_buf_bytes);
-        /* Encode silence frames so BCLK/LRCK still toggle correctly */
         for (size_t f = 0; f < handle->frames_per_buf; f++) {
             uint8_t *frame_ptr = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
             encode_frame(handle, frame_ptr, NULL);
@@ -410,12 +431,17 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
                                     handle->dma_buf_bytes * 8,
                                     &tx_cfg),
             TAG, "initial silence transmit failed");
-        /* Consume one semaphore slot per queued buffer */
         xSemaphoreTake(handle->write_sem, 0);
     }
 
-    ESP_LOGI(TAG, "transmitter enabled, Fs=%"PRIu32", %u-bit, %u data lines",
-             handle->sample_rate, handle->bits_per_sample, handle->num_data_lines);
+    const char *mode_str =
+        (handle->mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
+        (handle->mode == PARLIO_I2S_MODE_TDM4) ? "TDM4" :
+        (handle->mode == PARLIO_I2S_MODE_TDM8) ? "TDM8" : "TDM16";
+    ESP_LOGI(TAG, "TX enabled: %s, Fs=%"PRIu32", %u-bit, %u ch (%u lines x %u slots)",
+             mode_str, handle->sample_rate, handle->bits_per_sample,
+             handle->num_slots * handle->num_data_lines,
+             handle->num_data_lines, handle->num_slots);
     return ESP_OK;
 }
 
@@ -442,11 +468,10 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
     ESP_RETURN_ON_FALSE(handle && samples, ESP_ERR_INVALID_ARG, TAG, "null arg");
     ESP_RETURN_ON_FALSE(handle->enabled, ESP_ERR_INVALID_STATE, TAG, "not enabled");
 
-    const size_t channels_per_frame = handle->num_data_lines * 2;
+    const size_t channels_per_frame = handle->num_data_lines * handle->num_slots;
     size_t written = 0;
 
     while (written < num_frames) {
-        /* If current buffer is full, submit it and move to the next */
         if (handle->write_frame_pos >= handle->frames_per_buf) {
             parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
             esp_err_t ret = parlio_tx_unit_transmit(
@@ -459,7 +484,6 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
             handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
             handle->write_frame_pos = 0;
 
-            /* Wait for a buffer to become available (TX done callback) */
             if (xSemaphoreTake(handle->write_sem,
                                pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
                 if (frames_written) *frames_written = written;
@@ -467,7 +491,6 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
             }
         }
 
-        /* Encode the frame into the current DMA buffer */
         uint8_t *frame_dst = handle->dma_bufs[handle->write_buf_idx]
                            + handle->write_frame_pos * handle->frame_buf_bytes;
         encode_frame(handle, frame_dst,
@@ -516,7 +539,5 @@ esp_err_t parlio_i2s_tx_delete(parlio_i2s_tx_handle_t handle)
 uint32_t parlio_i2s_tx_get_real_sample_rate(parlio_i2s_tx_handle_t handle)
 {
     if (!handle) return 0;
-    /* The actual rate depends on APLL rounding. We can query it from I2S info. */
-    /* For now, return the configured rate -- the APLL is usually very close. */
     return handle->sample_rate;
 }
