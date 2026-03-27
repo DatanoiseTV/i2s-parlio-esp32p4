@@ -77,20 +77,15 @@ static esp_err_t setup_i2s_rx(i2s_chan_handle_t *rx_chan)
         i2s_new_channel(&chan_cfg, NULL, rx_chan),
         TAG, "failed to create I2S RX channel");
 
-    /* In slave mode, use external clock source and provide the BCLK frequency.
-     * BCLK comes from PARLIO clk_out, WS from PARLIO TXD[0]. */
-    uint32_t bclk_freq = SLOT_WIDTH * 2 * SAMPLE_RATE; /* 3.072 MHz for 48k/32bit stereo */
+    /* Slave mode: BCLK and WS are driven externally by PARLIO.
+     * Use the default internal clock source -- in slave mode, it only affects
+     * DMA/FIFO timing, not the actual I2S bus clocking. */
     i2s_std_config_t std_cfg = {
-        .clk_cfg = {
-            .sample_rate_hz = SAMPLE_RATE,
-            .clk_src = I2S_CLK_SRC_EXTERNAL,
-            .ext_clk_freq_hz = bclk_freq,
-            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
-        },
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                          I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = PIN_BCLK,         /* "MCLK" input = BCLK pin (external clock source) */
+            .mclk = I2S_GPIO_UNUSED,
             .bclk = PIN_BCLK,          /* reads BCLK from PARLIO clk_out */
             .ws   = PIN_LRCK,          /* reads WS from PARLIO TXD[0] */
             .dout = I2S_GPIO_UNUSED,
