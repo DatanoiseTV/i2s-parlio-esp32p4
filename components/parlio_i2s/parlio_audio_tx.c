@@ -8,6 +8,7 @@
 #include "esp_heap_caps.h"
 #include "driver/parlio_tx.h"
 #include "driver/i2s_std.h"
+#include "driver/i2s_tdm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -88,7 +89,8 @@ struct parlio_audio_tx {
     size_t   write_frame_pos;
 
     SemaphoreHandle_t write_sem;
-    i2s_chan_handle_t       i2s_clk_chan;
+    i2s_chan_handle_t       i2s_clk_chan;  /* also used for HW audio output if i2s_hw configured */
+    bool                    i2s_hw_enabled; /* true if i2s_clk_chan also outputs audio */
     parlio_tx_unit_handle_t parlio_unit;
     bool enabled;
 };
@@ -521,26 +523,104 @@ esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
     h->write_sem = xSemaphoreCreateCounting(h->dma_buf_count, h->dma_buf_count);
     ESP_GOTO_ON_FALSE(h->write_sem, ESP_ERR_NO_MEM, fail, TAG, "alloc semaphore");
 
-    /* --- I2S MCLK from APLL --- */
+    /* --- I2S peripheral: APLL clock + optional HW audio output --- */
     {
-        i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-        cc.dma_desc_num = 2; cc.dma_frame_num = 16;
-        ret = i2s_new_channel(&cc, &h->i2s_clk_chan, NULL);
-        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock channel alloc failed");
+        const parlio_audio_i2s_hw_config_t *hw = config->i2s_hw;
 
-        i2s_std_config_t sc = {
-            .clk_cfg = { .sample_rate_hz = fs, .clk_src = I2S_CLK_SRC_APLL,
-                         .mclk_multiple = (i2s_mclk_multiple_t)mclk_mult },
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                             I2S_SLOT_MODE_STEREO),
-            .gpio_cfg = { .mclk = config->mclk_gpio,
-                          .bclk = I2S_GPIO_UNUSED, .ws = I2S_GPIO_UNUSED,
-                          .dout = I2S_GPIO_UNUSED, .din = I2S_GPIO_UNUSED },
-        };
-        ret = i2s_channel_init_std_mode(h->i2s_clk_chan, &sc);
-        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock init failed");
+        i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+        if (hw) {
+            cc.dma_desc_num  = hw->dma_desc_num  ? hw->dma_desc_num  : 6;
+            cc.dma_frame_num = hw->dma_frame_num ? hw->dma_frame_num : 240;
+        } else {
+            cc.dma_desc_num = 2;
+            cc.dma_frame_num = 16;
+        }
+        ret = i2s_new_channel(&cc, &h->i2s_clk_chan, NULL);
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S channel alloc failed");
+
+        if (hw && hw->total_slots > 2) {
+            /* TDM mode: supports 4/8/16 slots and multiple data outputs */
+            uint16_t nslots = hw->total_slots;
+            i2s_tdm_slot_mask_t mask = (1 << nslots) - 1; /* enable all slots */
+
+            i2s_tdm_config_t tc = {
+                .clk_cfg = {
+                    .sample_rate_hz = fs,
+                    .clk_src = I2S_CLK_SRC_APLL,
+                    .mclk_multiple = (i2s_mclk_multiple_t)mclk_mult,
+                },
+                .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(
+                    (i2s_data_bit_width_t)hw->bits_per_sample,
+                    I2S_SLOT_MODE_STEREO, mask),
+                .gpio_cfg = {
+                    .mclk = config->mclk_gpio,
+                    .bclk = hw->bclk_gpio,
+                    .ws   = hw->ws_gpio,
+                    .dout = hw->dout_gpio,
+                    .din  = I2S_GPIO_UNUSED,
+                },
+            };
+            if (hw->slot_width)
+                tc.slot_cfg.slot_bit_width = (i2s_slot_bit_width_t)hw->slot_width;
+            tc.slot_cfg.total_slot = nslots;
+
+            ret = i2s_channel_init_tdm_mode(h->i2s_clk_chan, &tc);
+            ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S TDM init failed");
+            h->i2s_hw_enabled = true;
+
+            /* Connect secondary data output if specified (I2S0 only) */
+            /* The TDM driver doesn't expose dout2 in gpio_cfg, but the
+             * secondary output shares the same data with slots split across
+             * both pins. For now we log it; full multi-dout TDM requires
+             * manual GPIO matrix routing after init. */
+            if (hw->dout2_gpio >= 0) {
+                ESP_LOGW(TAG, "I2S HW dout2 on GPIO %d -- multi-DOUT TDM requires "
+                         "manual GPIO matrix setup for the secondary data pin",
+                         hw->dout2_gpio);
+            }
+
+            ESP_LOGI(TAG, "  I2S HW: TDM%u, %u-bit, BCLK=%d WS=%d DOUT=%d",
+                     nslots, hw->bits_per_sample, hw->bclk_gpio, hw->ws_gpio, hw->dout_gpio);
+        } else if (hw) {
+            /* Standard stereo mode */
+            i2s_std_config_t sc = {
+                .clk_cfg = { .sample_rate_hz = fs, .clk_src = I2S_CLK_SRC_APLL,
+                             .mclk_multiple = (i2s_mclk_multiple_t)mclk_mult },
+                .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                    (i2s_data_bit_width_t)hw->bits_per_sample, I2S_SLOT_MODE_STEREO),
+                .gpio_cfg = {
+                    .mclk = config->mclk_gpio,
+                    .bclk = hw->bclk_gpio,
+                    .ws   = hw->ws_gpio,
+                    .dout = hw->dout_gpio,
+                    .din  = I2S_GPIO_UNUSED,
+                },
+            };
+            if (hw->slot_width)
+                sc.slot_cfg.slot_bit_width = (i2s_slot_bit_width_t)hw->slot_width;
+            ret = i2s_channel_init_std_mode(h->i2s_clk_chan, &sc);
+            ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S STD init failed");
+            h->i2s_hw_enabled = true;
+
+            ESP_LOGI(TAG, "  I2S HW: stereo, %u-bit, BCLK=%d WS=%d DOUT=%d",
+                     hw->bits_per_sample, hw->bclk_gpio, hw->ws_gpio, hw->dout_gpio);
+        } else {
+            /* Clock-only mode: minimal config, no audio output */
+            i2s_std_config_t sc = {
+                .clk_cfg = { .sample_rate_hz = fs, .clk_src = I2S_CLK_SRC_APLL,
+                             .mclk_multiple = (i2s_mclk_multiple_t)mclk_mult },
+                .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                                I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                .gpio_cfg = { .mclk = config->mclk_gpio,
+                              .bclk = I2S_GPIO_UNUSED, .ws = I2S_GPIO_UNUSED,
+                              .dout = I2S_GPIO_UNUSED, .din = I2S_GPIO_UNUSED },
+            };
+            ret = i2s_channel_init_std_mode(h->i2s_clk_chan, &sc);
+            ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock init failed");
+        }
+
         ret = i2s_channel_enable(h->i2s_clk_chan);
-        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S clock enable failed");
+        ESP_GOTO_ON_ERROR(ret, fail, TAG, "I2S enable failed");
     }
 
     /* --- PARLIO TX unit --- */
@@ -720,4 +800,10 @@ size_t parlio_audio_tx_get_frame_size(parlio_audio_tx_handle_t handle)
 uint32_t parlio_audio_tx_get_parlio_clock(parlio_audio_tx_handle_t handle)
 {
     return handle ? handle->parlio_clock : 0;
+}
+
+i2s_chan_handle_t parlio_audio_tx_get_i2s_hw_handle(parlio_audio_tx_handle_t handle)
+{
+    if (handle && handle->i2s_hw_enabled) return handle->i2s_clk_chan;
+    return NULL;
 }
