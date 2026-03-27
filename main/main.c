@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -50,13 +49,16 @@ static const char *TAG = "audio_demo";
 #define SAMPLE_RATE    48000
 #define TEST_SECONDS   30
 
-/* Generate a sine tone in left-justified int32_t */
-static int32_t sine_sample(float *phase, float freq, float amplitude)
+/* Fast integer ramp generator (no FPU, no sinf overhead).
+ * Produces a sawtooth wave at the given frequency. Each channel gets a
+ * distinct frequency so they're distinguishable on a scope/analyzer. */
+static int32_t ramp_sample(uint32_t *phase, uint32_t freq_hz)
 {
-    float s = amplitude * sinf(*phase);
-    *phase += 2.0f * (float)M_PI * freq / (float)SAMPLE_RATE;
-    if (*phase >= 2.0f * (float)M_PI) *phase -= 2.0f * (float)M_PI;
-    return (int32_t)(s * (float)INT32_MAX);
+    /* phase accumulator: full 32-bit range = one cycle.
+     * increment = freq * 2^32 / Fs */
+    uint32_t inc = (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE);
+    *phase += inc;
+    return (int32_t)*phase; /* already left-justified (full 32-bit range) */
 }
 
 void app_main(void)
@@ -147,19 +149,16 @@ void app_main(void)
         return;
     }
 
-    /* --- Tone generator state --- */
-    /* I2S: 440 Hz L, 880 Hz R */
-    float i2s_phase[2] = {0};
-    /* ADAT: 8 channels at 200-900 Hz */
-    float adat_phase[8] = {0};
-    /* I2S HW: 1000 Hz L, 1500 Hz R */
-    float hw_phase[2] = {0};
+    /* Ramp generator state (integer phase accumulators, zero FPU overhead) */
+    uint32_t i2s_phase[2] = {0};
+    uint32_t adat_phase[8] = {0};
+    uint32_t hw_phase[2] = {0};
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "=== Generating audio for %d seconds ===", TEST_SECONDS);
-    ESP_LOGI(TAG, "  PARLIO I2S:  440 Hz (L), 880 Hz (R)");
+    ESP_LOGI(TAG, "  PARLIO I2S:  440 Hz (L), 880 Hz (R) sawtooth");
     ESP_LOGI(TAG, "  PARLIO ADAT: 200-900 Hz across 8 channels");
-    ESP_LOGI(TAG, "  I2S HW:      1000 Hz (L), 1500 Hz (R)");
+    ESP_LOGI(TAG, "  I2S HW:      1000 Hz (L), 1500 Hz (R) sawtooth");
 
     int64_t start = esp_timer_get_time();
     int64_t end = start + (int64_t)TEST_SECONDS * 1000000;
@@ -171,20 +170,19 @@ void app_main(void)
             size_t base = f * parlio_frame_size;
 
             /* I2S: 2 samples (L, R) */
-            parlio_buf[base + 0] = sine_sample(&i2s_phase[0], 440.0f, 0.5f);
-            parlio_buf[base + 1] = sine_sample(&i2s_phase[1], 880.0f, 0.5f);
+            parlio_buf[base + 0] = ramp_sample(&i2s_phase[0], 440);
+            parlio_buf[base + 1] = ramp_sample(&i2s_phase[1], 880);
 
             /* ADAT: 8 samples (ch0..ch7) */
             for (int ch = 0; ch < 8; ch++) {
-                float freq = 200.0f + (float)ch * 100.0f;
-                parlio_buf[base + 2 + ch] = sine_sample(&adat_phase[ch], freq, 0.25f);
+                parlio_buf[base + 2 + ch] = ramp_sample(&adat_phase[ch], 200 + ch * 100);
             }
         }
 
         /* Generate I2S HW audio (separate buffer, separate write) */
         for (size_t f = 0; f < frames_per_write; f++) {
-            hw_buf[f * 2 + 0] = sine_sample(&hw_phase[0], 1000.0f, 0.5f);
-            hw_buf[f * 2 + 1] = sine_sample(&hw_phase[1], 1500.0f, 0.5f);
+            hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
+            hw_buf[f * 2 + 1] = ramp_sample(&hw_phase[1], 1500);
         }
 
         /* Write PARLIO path */
@@ -206,9 +204,6 @@ void app_main(void)
 
         total_frames += written;
 
-        /* Yield to let the idle task feed the watchdog */
-        taskYIELD();
-
         /* Periodic status */
         int elapsed = (int)((esp_timer_get_time() - start) / 1000000);
         if (elapsed > 0 && elapsed % 10 == 0 && total_frames % (SAMPLE_RATE * 10) < frames_per_write) {
@@ -227,23 +222,21 @@ void app_main(void)
     while (1) {
         for (size_t f = 0; f < frames_per_write; f++) {
             size_t base = f * parlio_frame_size;
-            parlio_buf[base + 0] = sine_sample(&i2s_phase[0], 440.0f, 0.5f);
-            parlio_buf[base + 1] = sine_sample(&i2s_phase[1], 880.0f, 0.5f);
+            parlio_buf[base + 0] = ramp_sample(&i2s_phase[0], 440);
+            parlio_buf[base + 1] = ramp_sample(&i2s_phase[1], 880);
             for (int ch = 0; ch < 8; ch++)
-                parlio_buf[base + 2 + ch] = sine_sample(&adat_phase[ch],
-                                                          200.0f + ch * 100.0f, 0.25f);
+                parlio_buf[base + 2 + ch] = ramp_sample(&adat_phase[ch], 200 + ch * 100);
         }
         parlio_audio_tx_write(tx, parlio_buf, frames_per_write, NULL, 1000);
 
         if (i2s_hw) {
             for (size_t f = 0; f < frames_per_write; f++) {
-                hw_buf[f * 2 + 0] = sine_sample(&hw_phase[0], 1000.0f, 0.5f);
-                hw_buf[f * 2 + 1] = sine_sample(&hw_phase[1], 1500.0f, 0.5f);
+                hw_buf[f * 2 + 0] = ramp_sample(&hw_phase[0], 1000);
+                hw_buf[f * 2 + 1] = ramp_sample(&hw_phase[1], 1500);
             }
             size_t bw = 0;
             i2s_channel_write(i2s_hw, hw_buf,
                               frames_per_write * 2 * sizeof(int32_t), &bw, 1000);
         }
-        taskYIELD();
     }
 }
