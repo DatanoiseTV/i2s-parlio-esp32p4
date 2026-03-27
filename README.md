@@ -40,6 +40,26 @@ Each MCLK tick, PARLIO shifts out one parallel word containing the instantaneous
 
 The APLL feed GPIO requires a short physical wire or PCB trace connecting the I2S MCLK output back to the PARLIO external clock input. On some board layouts this can be adjacent pins.
 
+## Use Cases
+
+### Multi-DAC Audio Systems
+Drive multiple I2S DAC chips from a single peripheral. With 14 data lines, you can feed up to 14 stereo DACs simultaneously with perfectly synchronized clocks -- useful for immersive audio installations, Ambisonics rigs, or line array speaker processors.
+
+### High Channel Count Recording Interfaces
+Build a 28-channel audio output stage for studio or live sound applications. All channels share the same MCLK/BCLK/LRCK, eliminating inter-channel clock drift that plagues multi-peripheral I2S setups.
+
+### Overcoming I2S Peripheral Limitations
+The ESP32-P4 has 3 I2S peripherals. If your design needs more than 3 independent I2S outputs, or needs more than the native TDM slot count, PARLIO gives you additional outputs without consuming I2S hardware (only one I2S channel is used as a clock source).
+
+### Custom Digital Audio Protocols
+Since BCLK, LRCK, and data are all software-defined in the DMA buffer, you can implement non-standard framing: asymmetric slot widths, custom LRCK patterns, DSP/PCM short/long frame sync, or even TDM with arbitrary slot counts per data line.
+
+### Deterministic Multi-Channel Test Signal Generation
+Generate precisely timed test signals across many channels simultaneously -- useful for production-line testing of audio hardware, speaker arrays, or codec verification.
+
+### ADAT/SPDIF Bitstream Generation
+With MCLK rates up to ~40 MHz (limited by PARLIO max clock) and fully software-defined output, you could synthesize ADAT lightpipe or SPDIF bitstreams directly, without dedicated transmitter ICs.
+
 ## Build
 
 ```bash

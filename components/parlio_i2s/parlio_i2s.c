@@ -319,6 +319,7 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
 
     struct parlio_i2s_tx *h = calloc(1, sizeof(*h));
     ESP_RETURN_ON_FALSE(h, ESP_ERR_NO_MEM, TAG, "alloc handle");
+    esp_err_t ret = ESP_OK;
 
     h->sample_rate    = config->sample_rate;
     h->bits_per_sample = config->bits_per_sample;
@@ -366,7 +367,7 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     ESP_GOTO_ON_FALSE(h->write_sem, ESP_ERR_NO_MEM, fail, TAG, "alloc semaphore");
 
     /* Set up APLL -> I2S MCLK -> GPIO loopback */
-    esp_err_t ret = setup_apll_clock(h, config->apll_feed_gpio);
+    ret = setup_apll_clock(h, config->apll_feed_gpio);
     ESP_GOTO_ON_ERROR(ret, fail, TAG, "APLL setup failed");
 
     /* Set up PARLIO TX with ext clock from the same GPIO */
