@@ -293,29 +293,62 @@ idf.py build
 idf.py flash monitor
 ```
 
+## Demo Application
+
+The included `main.c` demonstrates the unified driver outputting three protocols simultaneously:
+
+| Output | Protocol | Channels | Content |
+|--------|----------|----------|---------|
+| PARLIO TXD[0-2] | I2S Philips | 2 (stereo) | 440 Hz / 880 Hz sine |
+| PARLIO TXD[3] | ADAT | 8 | 200-900 Hz across channels |
+| I2S HW (GPIO 27-29) | I2S Philips | 2 (stereo) | 1000 Hz / 1500 Hz sine |
+| **Total** | | **12 channels** | All sample-locked |
+
+Requires a physical wire between GPIO 20 and GPIO 21 (MCLK loopback). Runs a 30-second timed test reporting effective sample rate, then loops continuously for scope inspection.
+
+GPIO assignments in the demo:
+- GPIO 20: MCLK out (wire source)
+- GPIO 21: PARLIO ext clk in (wire destination)
+- GPIO 22: PARLIO clk_out (256*Fs, usable as MCLK)
+- GPIO 23: I2S BCLK (PARLIO TXD[0], synthesized)
+- GPIO 24: I2S LRCK (PARLIO TXD[1])
+- GPIO 25: I2S DATA (PARLIO TXD[2])
+- GPIO 26: ADAT output (PARLIO TXD[3])
+- GPIO 27-29: I2S HW BCLK/WS/DOUT
+
 ## Component API
 
-See `components/parlio_i2s/include/parlio_i2s.h` for the full API:
+### Standalone drivers (single protocol, simple)
 
-- `parlio_i2s_tx_new()` -- create and configure (supports all modes)
-- `parlio_i2s_tx_enable()` -- start clocks and pre-fill silence
-- `parlio_i2s_tx_write()` -- write interleaved int32_t audio frames
-- `parlio_i2s_tx_disable()` -- stop output
-- `parlio_i2s_tx_delete()` -- free resources
+- `parlio_i2s.h` -- I2S/TDM transmitter (BCLK on clk_out, efficient)
+- `parlio_spdif_tx.h` -- S/PDIF transmitter (1-bit serial, BMC)
+- `parlio_adat_tx.h` -- ADAT transmitter (1-bit serial, NRZI)
 
-### Quick Example (TDM8, 2 lines = 16 channels)
+### Unified driver (multi-protocol, flexible)
+
+- `parlio_audio_tx.h` -- any combination of I2S + S/PDIF + ADAT + I2S HW passthrough
+
+Key functions:
+- `parlio_audio_tx_new()` -- configure protocols, auto-select clock rates
+- `parlio_audio_tx_enable()` -- start all outputs with silence pre-fill
+- `parlio_audio_tx_write()` -- write interleaved samples for all PARLIO protocols
+- `parlio_audio_tx_get_i2s_hw_handle()` -- get I2S channel for HW passthrough writes
+- `parlio_audio_tx_get_frame_size()` -- query samples per frame
+- `parlio_audio_tx_delete()` -- clean up
+
+### Quick Example (TDM8, 2 lines = 16 channels, standalone)
 
 ```c
 parlio_i2s_tx_config_t cfg = {
     .sample_rate    = 48000,
     .bits_per_sample = 32,
-    .slot_width     = 32,          /* 32 BCLK per slot, 256 BCLK per TDM8 frame */
+    .slot_width     = 32,
     .num_data_lines = 2,
-    .mclk_multiple  = 512,         /* MCLK = 24.576 MHz, MCLK/BCLK = 2 */
+    .mclk_multiple  = 512,
     .mode           = PARLIO_I2S_MODE_TDM8,
-    .mclk_gpio      = GPIO_NUM_10, /* MCLK out + PARLIO clk in */
-    .bclk_gpio      = GPIO_NUM_11, /* BCLK on dedicated clk_out */
-    .lrck_gpio      = GPIO_NUM_12, /* frame sync on TXD[0] */
+    .mclk_gpio      = GPIO_NUM_10,
+    .bclk_gpio      = GPIO_NUM_11,
+    .lrck_gpio      = GPIO_NUM_12,
     .data_gpios     = { GPIO_NUM_13, GPIO_NUM_14 },
     .dma_buffer_count  = 4,
     .frames_per_buffer = 64,
@@ -325,9 +358,6 @@ parlio_i2s_tx_handle_t tx;
 parlio_i2s_tx_new(&cfg, &tx);
 parlio_i2s_tx_enable(tx);
 
-/* Write 16-channel interleaved audio:
- * [line0_slot0, line0_slot1, ..., line0_slot7,
- *  line1_slot0, line1_slot1, ..., line1_slot7] per frame */
 int32_t samples[16];
 size_t written;
 parlio_i2s_tx_write(tx, samples, 1, &written, 1000);

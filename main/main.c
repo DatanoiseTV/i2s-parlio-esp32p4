@@ -134,7 +134,7 @@ void app_main(void)
     ESP_LOGI(TAG, "I2S HW handle: %s", i2s_hw ? "active" : "NULL");
 
     /* --- Allocate audio buffers --- */
-    const size_t frames_per_write = 32;
+    const size_t frames_per_write = 64;
 
     /* PARLIO buffer: [2 I2S samples] [8 ADAT samples] = 10 per frame */
     int32_t *parlio_buf = malloc(frames_per_write * parlio_frame_size * sizeof(int32_t));
@@ -206,6 +206,9 @@ void app_main(void)
 
         total_frames += written;
 
+        /* Yield to let the idle task feed the watchdog */
+        taskYIELD();
+
         /* Periodic status */
         int elapsed = (int)((esp_timer_get_time() - start) / 1000000);
         if (elapsed > 0 && elapsed % 10 == 0 && total_frames % (SAMPLE_RATE * 10) < frames_per_write) {
@@ -241,5 +244,6 @@ void app_main(void)
             i2s_channel_write(i2s_hw, hw_buf,
                               frames_per_write * 2 * sizeof(int32_t), &bw, 1000);
         }
+        taskYIELD();
     }
 }
