@@ -100,22 +100,36 @@ Typical MCLK multiples: 256x (standard/TDM4), 512x (TDM8), 1024x (TDM16).
 - Format: I2S Philips (standard) or TDM with 1-BCLK frame sync
 - All channels share MCLK/BCLK/LRCK -- zero inter-channel clock drift
 
+## Performance
+
+Verified on ESP32-P4 at 360 MHz, 48 kHz, 32-bit, 128 frames/buffer:
+
+| Configuration | Channels | Measured Rate | Status |
+|---------------|----------|---------------|--------|
+| I2S Stereo x1 | 2 | 48000 Hz | PASS |
+| I2S Stereo x2 | 4 | 48000 Hz | PASS |
+| TDM4 x1 | 4 | 48000 Hz | PASS |
+| TDM8 x1 | 8 | 48000 Hz | PASS |
+| TDM4 x2 | 8 | 48000 Hz | PASS |
+| TDM8 x2 | 16 | 48000 Hz | PASS |
+
+Key techniques for sustained real-time throughput:
+- **LUT encoder**: precomputed lookup table converts each byte of a sample into 8 output bytes in one uint64_t operation. Per-line LUTs OR'd together for multi-line configs.
+- **Loop DMA**: `parlio_tx_unit_transmit(loop_transmission=true)` uses DMA descriptor chaining (`gdma_link_concat`) for zero-gap buffer transitions.
+- **Absolute timing**: submissions paced by `esp_timer_get_time()` with frame-count-based absolute targets (no truncation drift).
+- **Dedicated CPU1 task**: encoding runs at highest priority on CPU1, no competition with system tasks.
+
 ## Latency
 
-The output latency is determined by the DMA buffer pipeline:
+Output latency = `frames_per_buffer * 3 / sample_rate` (3 rotating DMA buffers in loop mode).
 
-```
-Latency = frames_per_buffer * dma_buffer_count / sample_rate
-```
+| frames_per_buffer | Latency @ 48 kHz |
+|-------------------|-------------------|
+| 128 | 8 ms |
+| 64 | 4 ms |
+| 32 | 2 ms |
 
-| frames_per_buffer | dma_buffer_count | Latency @ 48 kHz |
-|-------------------|-----------------|-------------------|
-| 64 | 4 | 5.3 ms |
-| 128 | 4 | 10.7 ms |
-| 32 | 3 | 2.0 ms |
-| 16 | 2 | 0.67 ms |
-
-The minimum practical latency depends on how fast your application can fill DMA buffers. With smaller buffers, the CPU has less time to prepare the next chunk before an underrun occurs. For real-time audio processing at 48 kHz, 2-4 ms (32-64 frames, 2-4 buffers) is a reasonable target.
+The generalized LUT encoder is fast enough for all configurations at 128 frames/buffer. Smaller buffers may work for simpler configs (stereo, TDM4).
 
 There is no additional latency from clock synchronization -- BCLK, LRCK, and all data lines are output from the same PARLIO clock domain in the same DMA cycle, so all signals are phase-aligned to within a single MCLK period (< 100 ns at typical audio rates).
 
