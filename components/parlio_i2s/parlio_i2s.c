@@ -410,7 +410,7 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
             uint8_t *frame_ptr = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
             encode_frame(handle, frame_ptr, NULL);
         }
-        parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
+        parlio_transmit_config_t tx_cfg = { .idle_value = 0, .flags.queue_nonblocking = 1 };
         ESP_RETURN_ON_ERROR(
             parlio_tx_unit_transmit(handle->parlio_unit,
                                     handle->dma_bufs[i],
@@ -459,7 +459,7 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
 
     while (written < num_frames) {
         if (handle->write_frame_pos >= handle->frames_per_buf) {
-            parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
+            parlio_transmit_config_t tx_cfg = { .idle_value = 0, .flags.queue_nonblocking = 1 };
             esp_err_t ret = parlio_tx_unit_transmit(
                 handle->parlio_unit,
                 handle->dma_bufs[handle->write_buf_idx],
