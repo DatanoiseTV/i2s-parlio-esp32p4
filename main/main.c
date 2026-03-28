@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_ldo_regulator.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
@@ -631,10 +632,14 @@ void app_main(void)
         /* Note: reuse LRCK pin for ADAT since unified driver assigns its own TXD */
         run_unified_test_spdif("ADAT+Stereo8 (24ch)", 48000, &i2s_8x2, NULL, &adat_w_8stereo, 512);
 
+        printf("\n  [heap: %"PRIu32" free]\n", (uint32_t)esp_get_free_heap_size());
+
         /* ADAT 44.1 kHz (8 ch) */
         parlio_audio_adat_config_t adat_441 = { .adat_gpio = PIN_DATA0 };
         run_unified_test_spdif("ADAT 44.1k (8ch)", 44100, NULL, NULL, &adat_441, 512);
     }
+
+    printf("\n  [heap: %"PRIu32" free]\n", (uint32_t)esp_get_free_heap_size());
 
     /* ---- S/PDIF tests (via unified driver) ---- */
     printf("\n" C_BOLD "  --- S/PDIF (unified driver) ---" C_RESET "\n");
