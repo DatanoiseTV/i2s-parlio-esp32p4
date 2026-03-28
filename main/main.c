@@ -10,6 +10,7 @@
 #include "driver/pulse_cnt.h"
 
 #include "parlio_i2s.h"
+#include "parlio_audio_tx.h"
 
 static const char *TAG = "audio_test";
 
@@ -256,6 +257,179 @@ static void run_test(const char *label, uint32_t sample_rate,
     vTaskDelay(pdMS_TO_TICKS(200));
 }
 
+/* ------------------------------------------------------------------ */
+/*  Unified driver test (ADAT, ADAT+I2S combos)                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    parlio_audio_tx_handle_t tx;
+    size_t frame_size;
+    uint32_t sample_rate;
+    volatile uint32_t total_frames;
+    volatile bool running;
+} uctx_t;
+
+static void unified_audio_task(void *arg)
+{
+    uctx_t *ctx = (uctx_t *)arg;
+    const size_t fs = ctx->frame_size;
+
+    int32_t *buf = malloc(FRAMES_PER_BUF * fs * sizeof(int32_t));
+    if (!buf) { ctx->running = false; vTaskDelete(NULL); return; }
+
+    uint32_t ph[16] = {0};
+    uint32_t inc[16];
+    for (int ch = 0; ch < (int)fs && ch < 16; ch++)
+        inc[ch] = (uint32_t)(((uint64_t)(200 + ch * 100) << 32) / ctx->sample_rate);
+
+    while (ctx->running) {
+        for (size_t f = 0; f < FRAMES_PER_BUF; f++) {
+            size_t base = f * fs;
+            for (size_t ch = 0; ch < fs; ch++) {
+                ph[ch % 16] += inc[ch % 16];
+                buf[base + ch] = (int32_t)ph[ch % 16];
+            }
+        }
+        size_t written = 0;
+        parlio_audio_tx_write(ctx->tx, buf, FRAMES_PER_BUF, &written, 1000);
+        ctx->total_frames += written;
+    }
+
+    free(buf);
+    vTaskDelete(NULL);
+}
+
+static void run_unified_test(const char *label, uint32_t sample_rate,
+                              const parlio_audio_i2s_config_t *i2s_cfg,
+                              const parlio_audio_adat_config_t *adat_cfg,
+                              uint16_t mclk_mult)
+{
+    /* Count total channels */
+    int num_channels = 0;
+    uint32_t ticks_per_frame = 0;
+    if (i2s_cfg) {
+        uint8_t ns = (uint8_t)(i2s_cfg->mode ? i2s_cfg->mode : 2);
+        num_channels += i2s_cfg->num_data_lines * ns;
+        uint32_t bclk_tpf = 32 * ns;
+        if (bclk_tpf > ticks_per_frame) ticks_per_frame = bclk_tpf;
+    }
+    if (adat_cfg) {
+        num_channels += 8;
+        uint32_t adat_tpf = 256;
+        if (adat_tpf > ticks_per_frame) ticks_per_frame = adat_tpf;
+    }
+    /* In multi-protocol mode, PARLIO clock = max protocol rate.
+     * clk_out outputs that clock. ticks_per_frame = parlio_clock / Fs. */
+    uint32_t parlio_clock = ticks_per_frame * sample_rate;
+
+    test_num++;
+    printf("\n  " C_BOLD "[%2d/%d]" C_RESET " %-24s  %6"PRIu32" Hz  %3d ch  CLK=%.3f MHz\n",
+           test_num, test_total, label, sample_rate, num_channels, parlio_clock / 1e6f);
+    printf("         ");
+    fflush(stdout);
+
+    parlio_audio_tx_config_t cfg = {
+        .sample_rate = sample_rate,
+        .mclk_multiple = mclk_mult,
+        .mclk_gpio = PIN_MCLK,
+        .clk_out_gpio = PIN_BCLK, /* PCNT measures this pin */
+        .i2s = i2s_cfg,
+        .adat = adat_cfg,
+        .dma_buffer_count = 4,
+        .frames_per_buffer = FRAMES_PER_BUF,
+    };
+
+    parlio_audio_tx_handle_t tx = NULL;
+    esp_err_t err = parlio_audio_tx_new(&cfg, &tx);
+    if (err != ESP_OK) {
+        uint32_t mclk_hz = mclk_mult * sample_rate;
+        printf(C_YELLOW "SKIP" C_RESET " -- %s (MCLK=%.1f MHz)\n",
+               esp_err_to_name(err), mclk_hz / 1e6f);
+        if (num_results < MAX_RESULTS) {
+            result_t *r = &results[num_results++];
+            snprintf(r->label, sizeof(r->label), "%s", label);
+            r->sample_rate = sample_rate;
+            r->channels = num_channels;
+            r->status = "SKIP";
+        }
+        return;
+    }
+    parlio_audio_tx_enable(tx);
+
+    pcnt_unit_handle_t pcnt = setup_pcnt(PIN_BCLK);
+
+    static uctx_t uctx;
+    uctx.tx = tx;
+    uctx.frame_size = parlio_audio_tx_get_frame_size(tx);
+    uctx.sample_rate = sample_rate;
+    uctx.total_frames = 0;
+    uctx.running = true;
+
+    xTaskCreatePinnedToCore(unified_audio_task, "uaudio", 16384, &uctx,
+                            configMAX_PRIORITIES - 1, NULL, 1);
+
+    pcnt_unit_clear_count(pcnt);
+    pcnt_unit_start(pcnt);
+    int64_t t_start = esp_timer_get_time();
+
+    for (int s = 0; s < TEST_SECONDS; s++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        printf(".");
+        fflush(stdout);
+    }
+
+    pcnt_unit_stop(pcnt);
+    int final_count = 0;
+    pcnt_unit_get_count(pcnt, &final_count);
+    int64_t t_end = esp_timer_get_time();
+    double dt = (t_end - t_start) / 1e6;
+
+    uctx.running = false;
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* clk_out = PARLIO clock = ticks_per_frame * Fs.
+     * Measured Fs = counted_edges / dt / ticks_per_frame */
+    double hw_clk = final_count / dt;
+    double hw_fs = hw_clk / ticks_per_frame;
+    double sw_fs = uctx.total_frames / dt;
+    double err_ppm = (hw_fs - sample_rate) * 1e6 / sample_rate;
+
+    const char *color, *status;
+    if (hw_fs >= sample_rate * 0.9999 && hw_fs <= sample_rate * 1.0001) {
+        color = C_GREEN; status = "PASS";
+    } else if (hw_fs >= sample_rate * 0.999 && hw_fs <= sample_rate * 1.001) {
+        color = C_YELLOW; status = "OK";
+    } else if (hw_fs > 0) {
+        color = C_RED; status = "FAIL";
+    } else {
+        color = C_RED; status = "NO CLK";
+    }
+
+    int pcnt_expected = (int)(parlio_clock * dt + 0.5);
+    printf(" %s%s%s  Fs=%.1f Hz (%+.0f ppm)  PCNT=%d/%d\n",
+           color, status, C_RESET, hw_fs, err_ppm, final_count, pcnt_expected);
+
+    if (num_results < MAX_RESULTS) {
+        result_t *r = &results[num_results++];
+        snprintf(r->label, sizeof(r->label), "%s", label);
+        r->sample_rate = sample_rate;
+        r->channels = num_channels;
+        r->hw_fs = hw_fs;
+        r->sw_fs = sw_fs;
+        r->err_ppm = err_ppm;
+        r->pcnt_counted = final_count;
+        r->pcnt_expected = pcnt_expected;
+        r->status = status;
+    }
+
+    pcnt_unit_disable(pcnt);
+    pcnt_del_channel(s_pcnt_chan);
+    pcnt_del_unit(pcnt);
+    parlio_audio_tx_disable(tx);
+    parlio_audio_tx_delete(tx);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
 static void print_summary(void)
 {
     printf("\n");
@@ -311,7 +485,7 @@ void app_main(void)
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
     /* Count total tests */
-    test_total = 17 + 6 + 5 + 4 + 3; /* 48k + 96k + 192k + 44.1k + low */
+    test_total = 17 + 6 + 5 + 4 + 3 + 6; /* 48k + 96k + 192k + 44.1k + low + unified */
 
     printf("\n" C_BOLD "========================================" C_RESET "\n");
     printf(C_BOLD "  PARLIO I2S Throughput Sweep" C_RESET "\n");
@@ -372,6 +546,58 @@ void app_main(void)
     run_test("Stereo 8kHz",          8000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo 16kHz",        16000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo 32kHz",        32000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+
+    /* ---- Unified driver: ADAT and ADAT+I2S combos ---- */
+    printf("\n" C_BOLD "  --- Unified driver: ADAT + I2S combos ---" C_RESET "\n");
+    {
+        /* ADAT only (8 ch) */
+        parlio_audio_adat_config_t adat_only = { .adat_gpio = PIN_DATA0 };
+        run_unified_test("ADAT only (8ch)", 48000, NULL, &adat_only, 512);
+
+        /* ADAT + I2S stereo (10 ch) */
+        parlio_audio_i2s_config_t i2s_1x2 = {
+            .mode = PARLIO_AUDIO_I2S_STANDARD,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 1,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3 },
+        };
+        parlio_audio_adat_config_t adat_w_i2s = { .adat_gpio = PIN_DATA4 };
+        run_unified_test("ADAT+Stereo (10ch)", 48000, &i2s_1x2, &adat_w_i2s, 512);
+
+        /* ADAT + I2S TDM4 x2 (16 ch) */
+        parlio_audio_i2s_config_t i2s_2x4 = {
+            .mode = PARLIO_AUDIO_I2S_TDM4,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 2,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3, PIN_DATA4 },
+        };
+        parlio_audio_adat_config_t adat_w_tdm4 = { .adat_gpio = PIN_DATA5 };
+        run_unified_test("ADAT+TDM4x2 (16ch)", 48000, &i2s_2x4, &adat_w_tdm4, 512);
+
+        /* ADAT + I2S TDM8 x1 (16 ch) */
+        parlio_audio_i2s_config_t i2s_1x8 = {
+            .mode = PARLIO_AUDIO_I2S_TDM8,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 1,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3 },
+        };
+        parlio_audio_adat_config_t adat_w_tdm8 = { .adat_gpio = PIN_DATA4 };
+        run_unified_test("ADAT+TDM8x1 (16ch)", 48000, &i2s_1x8, &adat_w_tdm8, 512);
+
+        /* ADAT + I2S stereo x4 (16 ch) */
+        parlio_audio_i2s_config_t i2s_4x2 = {
+            .mode = PARLIO_AUDIO_I2S_STANDARD,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 4,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6 },
+        };
+        parlio_audio_adat_config_t adat_w_4stereo = { .adat_gpio = PIN_DATA7 };
+        run_unified_test("ADAT+Stereo4 (16ch)", 48000, &i2s_4x2, &adat_w_4stereo, 512);
+
+        /* ADAT 44.1 kHz (8 ch) */
+        parlio_audio_adat_config_t adat_441 = { .adat_gpio = PIN_DATA0 };
+        run_unified_test("ADAT 44.1k (8ch)", 44100, NULL, &adat_441, 512);
+    }
 
     /* ---- Summary ---- */
     print_summary();
