@@ -16,13 +16,18 @@ static const char *TAG = "audio_test";
 #define PIN_MCLK       GPIO_NUM_21
 #define PIN_BCLK       GPIO_NUM_22
 #define PIN_LRCK       GPIO_NUM_23
-#define PIN_DATA0      GPIO_NUM_24
-#define PIN_DATA1      GPIO_NUM_25
-#define PIN_DATA2      GPIO_NUM_5
-#define PIN_DATA3      GPIO_NUM_32
-#define PIN_DATA4      GPIO_NUM_33
-#define PIN_DATA5      GPIO_NUM_2
-#define PIN_DATA6      GPIO_NUM_3
+#define PIN_DATA0      GPIO_NUM_5
+#define PIN_DATA1      GPIO_NUM_32
+#define PIN_DATA2      GPIO_NUM_33
+#define PIN_DATA3      GPIO_NUM_36
+#define PIN_DATA4      GPIO_NUM_54
+/* Safe green GPIOs from ESP32-P4-NANO pinout (no USB/UART/XTAL/I2C) */
+#define PIN_DATA5      GPIO_NUM_45
+#define PIN_DATA6      GPIO_NUM_46
+#define PIN_DATA7      GPIO_NUM_47
+#define PIN_DATA8      GPIO_NUM_48
+#define PIN_DATA9      GPIO_NUM_6
+#define PIN_DATA10     GPIO_NUM_53
 
 #define TEST_SECONDS   5
 #define FRAMES_PER_BUF 128
@@ -112,8 +117,10 @@ static pcnt_unit_handle_t setup_pcnt(gpio_num_t bclk_gpio)
 
 static const gpio_num_t data_gpios[] = {
     PIN_DATA0, PIN_DATA1, PIN_DATA2, PIN_DATA3,
-    PIN_DATA4, PIN_DATA5, PIN_DATA6
+    PIN_DATA4, PIN_DATA5, PIN_DATA6, PIN_DATA7,
+    PIN_DATA8, PIN_DATA9, PIN_DATA10
 };
+#define NUM_DATA_GPIOS (sizeof(data_gpios) / sizeof(data_gpios[0]))
 
 static void run_test(const char *label, uint32_t sample_rate,
                      parlio_i2s_mode_t mode, uint8_t num_data_lines,
@@ -127,6 +134,15 @@ static void run_test(const char *label, uint32_t sample_rate,
            label, sample_rate, num_channels, bclk / 1e6f);
     fflush(stdout);
 
+    /* Adaptive frames_per_buffer: reduce for high channel counts to fit in RAM.
+     * Each frame = bclk_per_frame bytes (pw=8) or *2 (pw=16).
+     * 3 DMA buffers must fit in ~300KB. */
+    uint32_t bclk_per_frame = 32 * num_slots;
+    size_t bytes_per_frame = bclk_per_frame * (num_data_lines > 7 ? 2 : 1);
+    size_t fpb = FRAMES_PER_BUF;
+    while (fpb > 16 && fpb * bytes_per_frame * 3 > 250000)
+        fpb /= 2;
+
     parlio_i2s_tx_config_t cfg = {
         .sample_rate    = sample_rate,
         .bits_per_sample = 32,
@@ -138,9 +154,9 @@ static void run_test(const char *label, uint32_t sample_rate,
         .bclk_gpio      = PIN_BCLK,
         .lrck_gpio      = PIN_LRCK,
         .dma_buffer_count = 4,
-        .frames_per_buffer = FRAMES_PER_BUF,
+        .frames_per_buffer = fpb,
     };
-    for (int i = 0; i < num_data_lines && i < 7; i++)
+    for (int i = 0; i < num_data_lines && i < (int)NUM_DATA_GPIOS; i++)
         cfg.data_gpios[i] = data_gpios[i];
 
     parlio_i2s_tx_handle_t tx = NULL;
@@ -276,55 +292,60 @@ void app_main(void)
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
     printf("\n" C_BOLD "=== PARLIO I2S Throughput Sweep (PCNT-verified, %ds/test) ===" C_RESET "\n", TEST_SECONDS);
-    printf("  GPIOs: MCLK=%d BCLK=%d LRCK=%d DATA=%d,%d,%d,%d,%d,%d,%d\n\n",
-           PIN_MCLK, PIN_BCLK, PIN_LRCK,
-           PIN_DATA0, PIN_DATA1, PIN_DATA2, PIN_DATA3,
-           PIN_DATA4, PIN_DATA5, PIN_DATA6);
+    printf("  MCLK=%d BCLK=%d LRCK=%d\n", PIN_MCLK, PIN_BCLK, PIN_LRCK);
+    printf("  DATA: %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d (11 lines, max 176ch)\n\n",
+           PIN_DATA0, PIN_DATA1, PIN_DATA2, PIN_DATA3, PIN_DATA4,
+           PIN_DATA5, PIN_DATA6, PIN_DATA7, PIN_DATA8, PIN_DATA9, PIN_DATA10);
 
-    /* ---- 48 kHz ---- */
-    printf(C_BOLD "  -- 48 kHz --" C_RESET "\n");
-    run_test("Stereo x1",          48000, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo x2",          48000, PARLIO_I2S_MODE_STANDARD, 2, 256);
-    run_test("Stereo x4",          48000, PARLIO_I2S_MODE_STANDARD, 4, 256);
-    run_test("Stereo x7",          48000, PARLIO_I2S_MODE_STANDARD, 7, 256);
-    run_test("TDM4 x1 (4ch)",      48000, PARLIO_I2S_MODE_TDM4,    1, 256);
-    run_test("TDM4 x2 (8ch)",      48000, PARLIO_I2S_MODE_TDM4,    2, 256);
-    run_test("TDM4 x4 (16ch)",     48000, PARLIO_I2S_MODE_TDM4,    4, 256);
-    run_test("TDM4 x7 (28ch)",     48000, PARLIO_I2S_MODE_TDM4,    7, 256);
-    run_test("TDM8 x1 (8ch)",      48000, PARLIO_I2S_MODE_TDM8,    1, 512);
-    run_test("TDM8 x2 (16ch)",     48000, PARLIO_I2S_MODE_TDM8,    2, 512);
-    run_test("TDM8 x4 (32ch)",     48000, PARLIO_I2S_MODE_TDM8,    4, 512);
-    run_test("TDM8 x7 (56ch)",     48000, PARLIO_I2S_MODE_TDM8,    7, 512);
+    /* ---- 48 kHz: scaling data lines ---- */
+    printf(C_BOLD "  -- 48 kHz: channel scaling --" C_RESET "\n");
+    run_test("Stereo x1 (2ch)",     48000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo x4 (8ch)",     48000, PARLIO_I2S_MODE_STANDARD, 4,  256);
+    run_test("Stereo x7 (14ch)",    48000, PARLIO_I2S_MODE_STANDARD, 7,  256);
+    run_test("Stereo x11 (22ch)",   48000, PARLIO_I2S_MODE_STANDARD, 11, 256);
+    run_test("TDM4 x1 (4ch)",       48000, PARLIO_I2S_MODE_TDM4,    1,  256);
+    run_test("TDM4 x4 (16ch)",      48000, PARLIO_I2S_MODE_TDM4,    4,  256);
+    run_test("TDM4 x7 (28ch)",      48000, PARLIO_I2S_MODE_TDM4,    7,  256);
+    run_test("TDM4 x11 (44ch)",     48000, PARLIO_I2S_MODE_TDM4,    11, 256);
+    run_test("TDM8 x1 (8ch)",       48000, PARLIO_I2S_MODE_TDM8,    1,  512);
+    run_test("TDM8 x2 (16ch)",      48000, PARLIO_I2S_MODE_TDM8,    2,  512);
+    run_test("TDM8 x4 (32ch)",      48000, PARLIO_I2S_MODE_TDM8,    4,  512);
+    run_test("TDM8 x7 (56ch)",      48000, PARLIO_I2S_MODE_TDM8,    7,  512);
+    run_test("TDM8 x11 (88ch)",     48000, PARLIO_I2S_MODE_TDM8,    11, 512);
+    run_test("TDM16 x1 (16ch)",     48000, PARLIO_I2S_MODE_TDM16,   1,  1024);
+    run_test("TDM16 x4 (64ch)",     48000, PARLIO_I2S_MODE_TDM16,   4,  1024);
+    run_test("TDM16 x7 (112ch)",    48000, PARLIO_I2S_MODE_TDM16,   7,  1024);
+    run_test("TDM16 x11 (176ch)",   48000, PARLIO_I2S_MODE_TDM16,   11, 1024);
 
     /* ---- 96 kHz ---- */
     printf("\n" C_BOLD "  -- 96 kHz --" C_RESET "\n");
-    run_test("Stereo x1",          96000, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo x4",          96000, PARLIO_I2S_MODE_STANDARD, 4, 256);
-    run_test("TDM4 x1 (4ch)",      96000, PARLIO_I2S_MODE_TDM4,    1, 256);
-    run_test("TDM4 x4 (16ch)",     96000, PARLIO_I2S_MODE_TDM4,    4, 256);
-    run_test("TDM8 x1 (8ch)",      96000, PARLIO_I2S_MODE_TDM8,    1, 512);
-    run_test("TDM8 x2 (16ch)",     96000, PARLIO_I2S_MODE_TDM8,    2, 512);
+    run_test("Stereo x1 (2ch)",     96000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo x11 (22ch)",   96000, PARLIO_I2S_MODE_STANDARD, 11, 256);
+    run_test("TDM4 x4 (16ch)",      96000, PARLIO_I2S_MODE_TDM4,    4,  256);
+    run_test("TDM8 x1 (8ch)",       96000, PARLIO_I2S_MODE_TDM8,    1,  512);
+    run_test("TDM8 x4 (32ch)",      96000, PARLIO_I2S_MODE_TDM8,    4,  512);
+    run_test("TDM16 x1 (16ch)",     96000, PARLIO_I2S_MODE_TDM16,   1,  1024);
 
     /* ---- 192 kHz ---- */
     printf("\n" C_BOLD "  -- 192 kHz --" C_RESET "\n");
-    run_test("Stereo x1",          192000, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo x4",          192000, PARLIO_I2S_MODE_STANDARD, 4, 256);
-    run_test("TDM4 x1 (4ch)",      192000, PARLIO_I2S_MODE_TDM4,    1, 256);
-    run_test("TDM8 x1 (8ch)",      192000, PARLIO_I2S_MODE_TDM8,    1, 512);
+    run_test("Stereo x1 (2ch)",     192000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo x11 (22ch)",   192000, PARLIO_I2S_MODE_STANDARD, 11, 256);
+    run_test("TDM4 x1 (4ch)",       192000, PARLIO_I2S_MODE_TDM4,    1,  256);
+    run_test("TDM8 x1 (8ch)",       192000, PARLIO_I2S_MODE_TDM8,    1,  512);
+    run_test("TDM16 x1 (16ch)",     192000, PARLIO_I2S_MODE_TDM16,   1,  1024);
 
     /* ---- 44.1 kHz family ---- */
     printf("\n" C_BOLD "  -- 44.1 kHz family --" C_RESET "\n");
-    run_test("Stereo 44.1k",       44100, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("TDM8 x2 44.1k",      44100, PARLIO_I2S_MODE_TDM8,    2, 512);
-    run_test("Stereo 88.2k",       88200, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo 176.4k",     176400, PARLIO_I2S_MODE_STANDARD, 1, 256);
+    run_test("Stereo 44.1k",        44100, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("TDM8 x4 44.1k (32ch)",44100, PARLIO_I2S_MODE_TDM8,    4,  512);
+    run_test("Stereo 88.2k",        88200, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo 176.4k",      176400, PARLIO_I2S_MODE_STANDARD, 1,  256);
 
     /* ---- Low sample rates ---- */
     printf("\n" C_BOLD "  -- Low rates --" C_RESET "\n");
-    run_test("Stereo 8kHz",         8000, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo 16kHz",       16000, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo 22.05kHz",    22050, PARLIO_I2S_MODE_STANDARD, 1, 256);
-    run_test("Stereo 32kHz",       32000, PARLIO_I2S_MODE_STANDARD, 1, 256);
+    run_test("Stereo 8kHz",          8000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo 16kHz",        16000, PARLIO_I2S_MODE_STANDARD, 1,  256);
+    run_test("Stereo 32kHz",        32000, PARLIO_I2S_MODE_STANDARD, 1,  256);
 
     /* ---- Summary ---- */
     print_summary();
