@@ -34,9 +34,9 @@ static const char *TAG = "audio_demo";
 
 #define SAMPLE_RATE    48000
 #define TEST_SECONDS   30
-#define FRAMES_PER_WRITE 64
+#define FRAMES_PER_WRITE 256
 
-static int32_t ramp_sample(uint32_t *phase, uint32_t freq_hz)
+static inline __attribute__((always_inline)) int32_t ramp_sample(uint32_t *phase, uint32_t freq_hz)
 {
     uint32_t inc = (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE);
     *phase += inc;
