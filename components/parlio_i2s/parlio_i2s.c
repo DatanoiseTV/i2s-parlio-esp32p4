@@ -6,6 +6,8 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/parlio_tx.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
@@ -65,8 +67,9 @@ struct parlio_i2s_tx {
 
     i2s_chan_handle_t       i2s_clk_chan;
     parlio_tx_unit_handle_t parlio_unit;
+    int64_t  last_submit_us;    /* timestamp of last buffer submission (for loop pacing) */
     bool enabled;
-    bool loop_mode;             /* true if using loop transmission */
+    bool loop_mode;
 };
 
 static uint8_t next_parlio_width(uint8_t needed)
@@ -392,6 +395,7 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
     handle->submit_idx = 0;
     handle->encode_idx = 1;
     handle->encode_frame_pos = 0;
+    handle->last_submit_us = esp_timer_get_time();
 
     const char *mode_str =
         (handle->mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
@@ -423,6 +427,9 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
                         ESP_ERR_INVALID_ARG, TAG, "bad arg/state");
 
     const size_t cpf = handle->num_data_lines * handle->num_slots;
+    /* Buffer duration in microseconds for pacing loop mode submissions */
+    const int64_t buf_dur_us = (int64_t)handle->frames_per_buf * 1000000
+                             / handle->sample_rate;
     size_t written = 0;
 
     while (written < num_frames) {
@@ -432,8 +439,28 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
         handle->encode_frame_pos++;
         written++;
 
-        /* Buffer full: submit and rotate */
+        /* Buffer full: pace and submit */
         if (handle->encode_frame_pos >= handle->frames_per_buf) {
+            if (handle->loop_mode) {
+                /* In loop mode, pace submissions to the DMA drain rate.
+                 * No tx_done callback fires, so we use wall-clock timing.
+                 * Wait until enough time has passed since the last submit
+                 * for the DMA to have consumed one buffer. */
+                int64_t now = esp_timer_get_time();
+                int64_t elapsed = now - handle->last_submit_us;
+                if (elapsed < buf_dur_us) {
+                    esp_rom_delay_us((uint32_t)(buf_dur_us - elapsed));
+                }
+                handle->last_submit_us = esp_timer_get_time();
+            } else {
+                /* One-shot mode: wait for semaphore (tx_done callback) */
+                if (xSemaphoreTake(handle->write_sem,
+                                   pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+                    if (frames_written) *frames_written = written;
+                    return ESP_ERR_TIMEOUT;
+                }
+            }
+
             parlio_transmit_config_t tx_cfg = {
                 .idle_value = 0,
                 .flags.loop_transmission = handle->loop_mode ? 1 : 0,
@@ -446,8 +473,6 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
             ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
 
             handle->submit_idx = handle->encode_idx;
-            /* Rotate: next encode buffer is 2 positions behind submit
-             * (guaranteed free since DMA has moved past it) */
             handle->encode_idx = (handle->encode_idx + 1) % 3;
             handle->encode_frame_pos = 0;
         }
