@@ -48,6 +48,8 @@ typedef struct {
     double hw_fs;
     double sw_fs;
     double err_ppm;
+    int pcnt_counted;
+    int pcnt_expected;
     const char *status;
 } result_t;
 
@@ -227,8 +229,9 @@ static void run_test(const char *label, uint32_t sample_rate,
         color = C_RED; status = "NO CLK";
     }
 
-    printf(" %s%s%s  HW=%.1f Hz (%+.0f ppm)  SW=%.0f Hz\n",
-           color, status, C_RESET, hw_fs, err_ppm, sw_fs);
+    int pcnt_expected = (int)(bclk * dt + 0.5);
+    printf(" %s%s%s  Fs=%.1f Hz (%+.0f ppm)  PCNT=%d/%d\n",
+           color, status, C_RESET, hw_fs, err_ppm, final_count, pcnt_expected);
 
     if (num_results < MAX_RESULTS) {
         result_t *r = &results[num_results++];
@@ -238,6 +241,8 @@ static void run_test(const char *label, uint32_t sample_rate,
         r->hw_fs = hw_fs;
         r->sw_fs = sw_fs;
         r->err_ppm = err_ppm;
+        r->pcnt_counted = final_count;
+        r->pcnt_expected = pcnt_expected;
         r->status = status;
     }
 
@@ -255,9 +260,9 @@ static void print_summary(void)
     printf(C_BOLD "========================================" C_RESET "\n");
     printf(C_BOLD "  EXECUTIVE SUMMARY" C_RESET "\n");
     printf(C_BOLD "========================================" C_RESET "\n\n");
-    printf("  %-24s %7s  %3s  %10s  %7s  %s\n",
-           "Configuration", "Target", "Ch", "Measured", "Error", "");
-    printf("  --------------------------------------------------------------------------\n");
+    printf("  %-24s %7s  %3s  %10s  %7s  %15s  %s\n",
+           "Configuration", "Target", "Ch", "Measured", "Error", "PCNT cnt/exp", "");
+    printf("  -----------------------------------------------------------------------------------------\n");
 
     int pass = 0, ok = 0, fail = 0, skip = 0;
     for (int i = 0; i < num_results; i++) {
@@ -269,17 +274,20 @@ static void print_summary(void)
         else { color = C_RED; fail++; }
 
         if (r->hw_fs > 0) {
-            printf("  %-24s %6"PRIu32"  %3d  %9.1f Hz  %+5.0fppm  %s%4s%s\n",
+            printf("  %-24s %6"PRIu32"  %3d  %9.1f Hz  %+5.0fppm  %7d/%-7d  %s%4s%s\n",
                    r->label, r->sample_rate, r->channels,
-                   r->hw_fs, r->err_ppm, color, r->status, C_RESET);
+                   r->hw_fs, r->err_ppm,
+                   r->pcnt_counted, r->pcnt_expected,
+                   color, r->status, C_RESET);
         } else {
-            printf("  %-24s %6"PRIu32"  %3d  %9s     %7s  %s%4s%s\n",
+            printf("  %-24s %6"PRIu32"  %3d  %9s     %7s  %15s  %s%4s%s\n",
                    r->label, r->sample_rate, r->channels,
-                   "--", "--", color, r->status, C_RESET);
+                   "--", "--", "--",
+                   color, r->status, C_RESET);
         }
     }
 
-    printf("  --------------------------------------------------------------------------\n");
+    printf("  -----------------------------------------------------------------------------------------\n");
     printf("  %d tests: ", num_results);
     if (pass > 0) printf(C_GREEN "%d PASS" C_RESET "  ", pass);
     if (ok > 0)   printf(C_YELLOW "%d OK" C_RESET "  ", ok);

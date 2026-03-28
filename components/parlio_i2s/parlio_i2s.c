@@ -218,7 +218,7 @@ static esp_err_t setup_apll_clock(struct parlio_i2s_tx *h, gpio_num_t mclk_gpio)
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(h->i2s_clk_chan, &std_cfg),
                         TAG, "I2S init failed");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(h->i2s_clk_chan), TAG, "I2S enable failed");
-    ESP_LOGI(TAG, "APLL: MCLK=%"PRIu32" Hz on GPIO %d", h->mclk_freq, mclk_gpio);
+    ESP_LOGD(TAG, "APLL: MCLK=%"PRIu32" Hz on GPIO %d", h->mclk_freq, mclk_gpio);
     return ESP_OK;
 }
 
@@ -249,7 +249,7 @@ static esp_err_t setup_parlio(struct parlio_i2s_tx *h, const parlio_i2s_tx_confi
     ESP_RETURN_ON_ERROR(parlio_tx_unit_register_event_callbacks(h->parlio_unit, &cbs, h),
                         TAG, "PARLIO callbacks failed");
 
-    ESP_LOGI(TAG, "PARLIO TX: width=%u, BCLK=%"PRIu32" Hz (MCLK/%u), "
+    ESP_LOGD(TAG, "PARLIO TX: width=%u, BCLK=%"PRIu32" Hz (MCLK/%u), "
              "%u slots/line, %u data lines, %u total channels",
              h->parlio_width, h->bclk_freq,
              (unsigned)(h->mclk_freq / h->bclk_freq),
@@ -324,7 +324,7 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     /* Use loop mode for gapless output */
     h->loop_mode = true;
 
-    ESP_LOGI(TAG, "mode=%s, %u slots/line, %u lines, %u ch, "
+    ESP_LOGD(TAG, "mode=%s, %u slots/line, %u lines, %u ch, "
              "MCLK=%"PRIu32", BCLK=%"PRIu32" (ratio %u), "
              "frame=%u B, dma=%u B, loop=%s",
              (mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
@@ -392,7 +392,7 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
         (handle->mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
         (handle->mode == PARLIO_I2S_MODE_TDM4) ? "TDM4" :
         (handle->mode == PARLIO_I2S_MODE_TDM8) ? "TDM8" : "TDM16";
-    ESP_LOGI(TAG, "TX enabled (%s DMA): %s, Fs=%"PRIu32", %u-bit, %u ch",
+    ESP_LOGD(TAG, "TX enabled (%s DMA): %s, Fs=%"PRIu32", %u-bit, %u ch",
              handle->loop_mode ? "loop" : "one-shot", mode_str,
              handle->sample_rate, handle->bits_per_sample,
              handle->num_slots * handle->num_data_lines);
