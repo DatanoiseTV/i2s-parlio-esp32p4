@@ -167,27 +167,43 @@ All outputs share the same APLL clock -- zero inter-channel and inter-protocol c
 
 Hardware-verified on ESP32-P4 at 360 MHz using PCNT (pulse counter) to count actual clock edges on the output pin. **40 tests, 40 PASS**, sub-ppm accuracy:
 
+**I2S / TDM (standalone driver)**
+
 | Configuration | Channels | Clock Rate | Measured Fs | Error |
 |---------------|----------|------------|-------------|-------|
-| I2S Stereo x1 | 2 | 3.072 MHz | 48000.0 Hz | -1 ppm |
-| I2S Stereo x11 | 22 | 3.072 MHz | 48000.0 Hz | -1 ppm |
-| TDM4 x11 | 44 | 6.144 MHz | 48000.0 Hz | 0 ppm |
-| TDM8 x11 | 88 | 12.288 MHz | 48000.0 Hz | 0 ppm |
+| Stereo x1 | 2 | 3.072 MHz | 48000.0 Hz | -1 ppm |
+| Stereo x11 | 22 | 3.072 MHz | 48000.0 Hz | -1 ppm |
+| TDM4 x11 | 44 | 6.144 MHz | 48000.0 Hz | -1 ppm |
+| TDM8 x11 | 88 | 12.288 MHz | 48000.0 Hz | -1 ppm |
 | TDM16 x11 | 176 | 24.576 MHz | 48000.0 Hz | -1 ppm |
-| ADAT only | 8 | 12.288 MHz | 48000.0 Hz | +1 ppm |
-| ADAT + Stereo x4 | 16 | 12.288 MHz | 48000.0 Hz | -1 ppm |
-| ADAT + TDM8 x4 | 40 | 12.288 MHz | 48000.0 Hz | 0 ppm |
-| ADAT + TDM4 x7 | 36 | 12.288 MHz | 48000.0 Hz | -1 ppm |
-| ADAT + Stereo x8 | 24 | 12.288 MHz | 48000.0 Hz | 0 ppm |
 | Stereo 96 kHz | 2 | 6.144 MHz | 96000.0 Hz | 0 ppm |
 | TDM8 x4 96 kHz | 32 | 24.576 MHz | 96000.0 Hz | -1 ppm |
-| Stereo 192 kHz | 2 | 12.288 MHz | 192000.0 Hz | -1 ppm |
-| Stereo x11 192 kHz | 22 | 12.288 MHz | 192000.0 Hz | 0 ppm |
+| Stereo 192 kHz | 2 | 12.288 MHz | 192000.0 Hz | -2 ppm |
+| Stereo x11 192 kHz | 22 | 12.288 MHz | 192000.0 Hz | -1 ppm |
 | Stereo 44.1 kHz | 2 | 2.822 MHz | 44100.0 Hz | -1 ppm |
 | TDM8 x4 44.1 kHz | 32 | 11.290 MHz | 44100.0 Hz | -1 ppm |
 | Stereo 8 kHz | 2 | 0.512 MHz | 8000.0 Hz | 0 ppm |
 
-Full test suite: 40 tests across 8 kHz to 192 kHz, stereo to TDM16, standalone I2S and unified ADAT+I2S combos, 1 to 11 data lines. All PASS within 2 ppm.
+**S/PDIF (unified driver)**
+
+| Configuration | Channels | Clock Rate | Measured Fs | Error |
+|---------------|----------|------------|-------------|-------|
+| S/PDIF only | 2 | 6.144 MHz | 48000.0 Hz | +1 ppm |
+| S/PDIF + Stereo | 4 | 6.144 MHz | 48000.0 Hz | 0 ppm |
+| S/PDIF + ADAT | 10 | 12.288 MHz | 48000.0 Hz | 0 ppm |
+| I2S + S/PDIF + ADAT | 14 | 12.288 MHz | 48000.0 Hz | -1 ppm |
+
+**ADAT (unified driver)**
+
+| Configuration | Channels | Clock Rate | Measured Fs | Error |
+|---------------|----------|------------|-------------|-------|
+| ADAT only | 8 | 12.288 MHz | 48000.0 Hz | -1 ppm |
+| ADAT + Stereo | 10 | 12.288 MHz | 48000.0 Hz | 0 ppm |
+| ADAT + TDM4 x2 | 16 | 12.288 MHz | 48000.0 Hz | -1 ppm |
+| ADAT + TDM8 x1 | 16 | 12.288 MHz | 48000.0 Hz | -1 ppm |
+| ADAT + TDM8 x4 | 40 | 12.288 MHz | 48000.0 Hz | -1 ppm |
+
+Full test suite: 40 configurations across 8 kHz to 192 kHz, stereo to TDM16, I2S + S/PDIF + ADAT standalone and combined, 1 to 11 data lines. All PASS within 2 ppm. All three protocols verified simultaneously.
 
 ### Key Techniques
 
