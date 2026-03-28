@@ -67,7 +67,8 @@ struct parlio_i2s_tx {
 
     i2s_chan_handle_t       i2s_clk_chan;
     parlio_tx_unit_handle_t parlio_unit;
-    int64_t  last_submit_us;    /* timestamp of last buffer submission (for loop pacing) */
+    int64_t  start_time_us;     /* wall-clock time when output started */
+    uint64_t total_submitted;   /* total frames submitted (for absolute timing) */
     bool enabled;
     bool loop_mode;
 };
@@ -395,7 +396,8 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
     handle->submit_idx = 0;
     handle->encode_idx = 1;
     handle->encode_frame_pos = 0;
-    handle->last_submit_us = esp_timer_get_time();
+    handle->start_time_us = esp_timer_get_time();
+    handle->total_submitted = handle->frames_per_buf; /* buf[0] already submitted */
 
     const char *mode_str =
         (handle->mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
@@ -427,9 +429,6 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
                         ESP_ERR_INVALID_ARG, TAG, "bad arg/state");
 
     const size_t cpf = handle->num_data_lines * handle->num_slots;
-    /* Buffer duration in microseconds for pacing loop mode submissions */
-    const int64_t buf_dur_us = (int64_t)handle->frames_per_buf * 1000000
-                             / handle->sample_rate;
     size_t written = 0;
 
     while (written < num_frames) {
@@ -442,16 +441,16 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
         /* Buffer full: pace and submit */
         if (handle->encode_frame_pos >= handle->frames_per_buf) {
             if (handle->loop_mode) {
-                /* In loop mode, pace submissions to the DMA drain rate.
-                 * No tx_done callback fires, so we use wall-clock timing.
-                 * Wait until enough time has passed since the last submit
-                 * for the DMA to have consumed one buffer. */
+                /* Compute the absolute wall-clock target for this submission
+                 * from the total frame count. No integer truncation accumulates
+                 * because we always divide the full product. */
+                handle->total_submitted += handle->frames_per_buf;
+                int64_t target_us = handle->start_time_us
+                    + (int64_t)(handle->total_submitted * 1000000ULL / handle->sample_rate);
                 int64_t now = esp_timer_get_time();
-                int64_t elapsed = now - handle->last_submit_us;
-                if (elapsed < buf_dur_us) {
-                    esp_rom_delay_us((uint32_t)(buf_dur_us - elapsed));
+                if (target_us > now) {
+                    esp_rom_delay_us((uint32_t)(target_us - now));
                 }
-                handle->last_submit_us = esp_timer_get_time();
             } else {
                 /* One-shot mode: wait for semaphore (tx_done callback) */
                 if (xSemaphoreTake(handle->write_sem,
