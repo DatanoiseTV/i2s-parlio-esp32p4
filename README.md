@@ -265,3 +265,42 @@ int32_t samples[16];
 size_t written;
 parlio_i2s_tx_write(tx, samples, 1, &written, 1000);
 ```
+
+## Benchmarks
+
+```
+Configuration                   Fs   Ch      HW Fs    Error   SW Fs  Status
+------------------------------------------------------------------------
+Stereo x1                   48000    2    47999.9     -1ppm    47982  PASS
+Stereo x2                   48000    4    48000.0     -0ppm    48055  PASS
+Stereo x4                   48000    8    47999.9     -1ppm    48058  PASS
+Stereo x7                   48000   14    48000.0     -0ppm    48061  PASS
+TDM4 x1 (4ch)               48000    4    48000.0     -0ppm    48052  PASS
+TDM4 x2 (8ch)               48000    8    48000.0     -0ppm    48052  PASS
+TDM4 x4 (16ch)              48000   16    48000.0     -0ppm    48054  PASS
+TDM4 x7 (28ch)              48000   28    48000.0     -0ppm    48054  PASS
+TDM8 x1 (8ch)               48000    8    48000.0     -0ppm    48053  PASS
+TDM8 x2 (16ch)              48000   16    48000.0     -0ppm    48056  PASS
+TDM8 x4 (32ch)              48000   32    48000.0     -0ppm    48056  PASS
+TDM8 x7 (56ch)              48000   56    48000.0     -0ppm    48056  PASS
+Stereo x1                   96000    2    96000.0     -0ppm    96121  PASS
+Stereo x4                   96000    8    96000.0     -0ppm    96116  PASS
+TDM4 x1 (4ch)               96000    4    96000.1     +1ppm    96107  PASS
+TDM4 x4 (16ch)              96000   16    96000.0     -0ppm    96112  PASS
+TDM8 x1 (8ch)               96000    8    96000.0     -0ppm    96107  PASS
+TDM8 x2 (16ch)              96000   16    96000.0     -0ppm    96112  PASS
+Stereo x1                  192000    2   191999.9     -0ppm   192229  PASS
+Stereo x4                  192000    8   191999.9     -0ppm   192243  PASS
+TDM4 x1 (4ch)              192000    4   191999.9     -0ppm   192231  PASS
+Stereo 44.1k                44100    2    44100.0     -0ppm    44140  PASS
+TDM8 x2 44.1k               44100   16    44100.0     -1ppm    44142  PASS
+Stereo 88.2k                88200    2    88199.9     -1ppm    88296  PASS
+Stereo 176.4k              176400    2   176399.9     -1ppm   176626  PASS
+Stereo 8kHz                  8000    2     8000.0     -0ppm     7987  PASS
+Stereo 16kHz                16000    2    16000.0     -0ppm    16003  PASS
+Stereo 22.05kHz             22050    2    22050.0     -0ppm    22071  PASS
+Stereo 32kHz                32000    2    32000.0     -0ppm    32031  PASS
+------------------------------------------------------------------------
+Total: 30 tests | 29 PASS 1 SKIP
+```
+
