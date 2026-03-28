@@ -168,7 +168,9 @@ static void run_test(const char *label, uint32_t sample_rate,
     parlio_i2s_tx_handle_t tx = NULL;
     esp_err_t err = parlio_i2s_tx_new(&cfg, &tx);
     if (err != ESP_OK) {
-        printf(C_YELLOW "SKIP" C_RESET " -- %s\n", esp_err_to_name(err));
+        uint32_t mclk_hz = mclk_mult * sample_rate;
+        printf(C_YELLOW "SKIP" C_RESET " -- %s (MCLK=%.1f MHz too high?)\n",
+               esp_err_to_name(err), mclk_hz / 1e6f);
         if (num_results < MAX_RESULTS) {
             result_t *r = &results[num_results++];
             snprintf(r->label, sizeof(r->label), "%s", label);
@@ -346,17 +348,17 @@ void app_main(void)
     run_test("Stereo x1 (2ch)",     96000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo x11 (22ch)",   96000, PARLIO_I2S_MODE_STANDARD, 11, 256);
     run_test("TDM4 x4 (16ch)",      96000, PARLIO_I2S_MODE_TDM4,    4,  256);
-    run_test("TDM8 x1 (8ch)",       96000, PARLIO_I2S_MODE_TDM8,    1,  512);
-    run_test("TDM8 x4 (32ch)",      96000, PARLIO_I2S_MODE_TDM8,    4,  512);
-    run_test("TDM16 x1 (16ch)",     96000, PARLIO_I2S_MODE_TDM16,   1,  1024);
+    run_test("TDM8 x1 (8ch)",       96000, PARLIO_I2S_MODE_TDM8,    1,  256);
+    run_test("TDM8 x4 (32ch)",      96000, PARLIO_I2S_MODE_TDM8,    4,  256);
+    run_test("TDM16 x1 (16ch)",     96000, PARLIO_I2S_MODE_TDM16,   1,  512);
 
     /* ---- 192 kHz ---- */
     printf("\n" C_BOLD "  --- 192 kHz ---" C_RESET "\n");
-    run_test("Stereo x1 (2ch)",     192000, PARLIO_I2S_MODE_STANDARD, 1,  256);
-    run_test("Stereo x11 (22ch)",   192000, PARLIO_I2S_MODE_STANDARD, 11, 256);
-    run_test("TDM4 x1 (4ch)",       192000, PARLIO_I2S_MODE_TDM4,    1,  256);
-    run_test("TDM8 x1 (8ch)",       192000, PARLIO_I2S_MODE_TDM8,    1,  512);
-    run_test("TDM16 x1 (16ch)",     192000, PARLIO_I2S_MODE_TDM16,   1,  1024);
+    run_test("Stereo x1 (2ch)",     192000, PARLIO_I2S_MODE_STANDARD, 1,  128);
+    run_test("Stereo x11 (22ch)",   192000, PARLIO_I2S_MODE_STANDARD, 11, 128);
+    run_test("TDM4 x1 (4ch)",       192000, PARLIO_I2S_MODE_TDM4,    1,  128);
+    run_test("TDM8 x1 (8ch)",       192000, PARLIO_I2S_MODE_TDM8,    1,  256);
+    run_test("TDM16 x1 (16ch)",     192000, PARLIO_I2S_MODE_TDM16,   1,  512);
 
     /* ---- 44.1 kHz family ---- */
     printf("\n" C_BOLD "  --- 44.1 kHz family ---" C_RESET "\n");
