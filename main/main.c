@@ -36,11 +36,10 @@ static const char *TAG = "audio_demo";
 #define TEST_SECONDS   30
 #define FRAMES_PER_WRITE 256
 
-static inline __attribute__((always_inline)) int32_t ramp_sample(uint32_t *phase, uint32_t freq_hz)
+/* Pre-compute phase increment (call once per frequency, not per sample) */
+static inline uint32_t ramp_increment(uint32_t freq_hz)
 {
-    uint32_t inc = (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE);
-    *phase += inc;
-    return (int32_t)*phase;
+    return (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE);
 }
 
 typedef struct {
@@ -64,15 +63,19 @@ static void audio_task(void *arg)
         return;
     }
 
-    /* 2 channels (stereo) */
-    uint32_t phase[2] = {0};
-    const int nch = (int)fs; /* frame_size = num channels */
+    const int nch = (int)fs;
+    uint32_t phase[16] = {0};     /* up to 16 channels */
+    uint32_t inc[16] = {0};
+    for (int ch = 0; ch < nch && ch < 16; ch++)
+        inc[ch] = ramp_increment(440 + ch * 440);
 
     while (ctx->running) {
         for (size_t f = 0; f < fpw; f++) {
             size_t base = f * fs;
-            for (int ch = 0; ch < nch; ch++)
-                buf[base + ch] = ramp_sample(&phase[ch % 2], 440 + ch * 440);
+            for (int ch = 0; ch < nch; ch++) {
+                phase[ch] += inc[ch];
+                buf[base + ch] = (int32_t)phase[ch];
+            }
         }
 
         size_t written = 0;
