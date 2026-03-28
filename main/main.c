@@ -125,9 +125,8 @@ static void run_test(const char *label, parlio_i2s_mode_t mode,
     ESP_LOGI(TAG, "  Result: %"PRIu32" Hz (%.2f%%) -- %s",
              eff, pct, pct >= 99.9f ? "PASS" : (pct >= 99.0f ? "OK" : "UNDERRUN"));
 
-    /* Clean up */
-    if (task) vTaskDelete(task);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    /* Wait for audio task to exit on its own (it checks ctx.running) */
+    vTaskDelay(pdMS_TO_TICKS(500));
     parlio_i2s_tx_disable(tx);
     parlio_i2s_tx_delete(tx);
     vTaskDelay(pdMS_TO_TICKS(200));
