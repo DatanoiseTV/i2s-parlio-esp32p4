@@ -15,28 +15,36 @@
 
 static const char *TAG = "parlio_i2s";
 
-/* Lookup tables for fast bit extraction.
- * For each byte value (0-255), stores 8 output bytes as a uint64_t.
- * LRCK=0: output byte = (bit << 1)          -> 0x00 or 0x02
- * LRCK=1: output byte = 0x01 | (bit << 1)   -> 0x01 or 0x03 */
-static DRAM_ATTR uint64_t lut_lrck0[256];
-static DRAM_ATTR uint64_t lut_lrck1[256];
-static bool lut_initialized = false;
+/*
+ * Per-line LUT for fast bit extraction.
+ * For each data line at TXD bit position (1+line), and each byte value (0-255),
+ * stores 8 output bytes as a uint64_t where each byte has the extracted bit
+ * placed at the correct position.
+ *
+ * line_lut[line][byte_val] = 8 bytes, each = ((byte_val >> (7-i)) & 1) << (1+line)
+ *
+ * The LRCK bit (position 0) is OR'd in separately.
+ * Max 15 lines supported (TXD[1..15]).
+ */
+#define MAX_LUT_LINES 15
+static DRAM_ATTR uint64_t line_lut[MAX_LUT_LINES][256];
+static DRAM_ATTR uint64_t lrck_mask; /* 0x0101010101010101 -- bit 0 set in all 8 bytes */
+static int lut_num_lines = 0;
 
-static void init_bit_lut(void)
+static void init_line_luts(int num_lines)
 {
-    if (lut_initialized) return;
-    for (int v = 0; v < 256; v++) {
-        uint8_t o0[8], o1[8];
-        for (int b = 0; b < 8; b++) {
-            uint8_t bit = (v >> (7 - b)) & 1;
-            o0[b] = bit << 1;
-            o1[b] = 0x01 | (bit << 1);
+    if (num_lines > MAX_LUT_LINES) num_lines = MAX_LUT_LINES;
+    for (int line = 0; line < num_lines; line++) {
+        int bit_pos = 1 + line; /* TXD[1+line] */
+        for (int v = 0; v < 256; v++) {
+            uint8_t out[8];
+            for (int b = 0; b < 8; b++)
+                out[b] = ((v >> (7 - b)) & 1) << bit_pos;
+            memcpy(&line_lut[line][v], out, 8);
         }
-        memcpy(&lut_lrck0[v], o0, 8);
-        memcpy(&lut_lrck1[v], o1, 8);
     }
-    lut_initialized = true;
+    lrck_mask = 0x0101010101010101ULL;
+    lut_num_lines = num_lines;
 }
 
 struct parlio_i2s_tx {
@@ -81,120 +89,101 @@ static uint8_t next_parlio_width(uint8_t needed)
 }
 
 /*
- * Fast LUT-based encoder for stereo I2S standard, 32-bit, 1 data line.
- * Produces 64 bytes of DMA data from one stereo sample pair.
+ * Generalized LUT encoder for ANY I2S/TDM config with 32-bit samples.
  *
- * Each output byte is one of {0x00, 0x01, 0x02, 0x03}:
- *   bit 0 = LRCK (0 for left, 1 for right)
- *   bit 1 = audio data bit
+ * Processes 8 output bytes at a time via uint64_t LUT lookups (one per data
+ * line per byte of the sample). Multiple lines are OR'd together.
+ * Works for standard I2S, TDM4, TDM8, TDM16 with 1..15 data lines.
  *
- * Uses precomputed LUT: one byte of sample -> 8 output bytes via uint64_t write.
- * 4 LUT lookups per channel = 8 total = 8 uint64_t stores for 64 output bytes.
+ * Each slot produces slot_width output bytes:
+ *   byte 0: LRCK/FSYNC padding (no data)
+ *   bytes 1..min(bps,sw-1): audio data bits, 8 at a time via LUT
+ *   remaining: zero-padded
  */
-static void IRAM_ATTR encode_frame_lut(uint8_t *restrict dst,
-                                        int32_t left, int32_t right)
+static void IRAM_ATTR encode_frame(struct parlio_i2s_tx *h,
+                                    uint8_t *dst,
+                                    const int32_t *samples)
 {
-    const uint8_t *L = (const uint8_t *)&left;
-    const uint8_t *R = (const uint8_t *)&right;
-
-    /* Left channel (LRCK=0): dst[0]=padding, dst[1..31]=31 data bits */
-    dst[0] = 0x00;
-    /* RISC-V is little-endian: L[3]=MSByte (bits 31-24), L[0]=LSByte (bits 7-0) */
-    memcpy(dst + 1,  &lut_lrck0[L[3]], 8);   /* bits 31-24 -> dst[1..8] */
-    memcpy(dst + 9,  &lut_lrck0[L[2]], 8);   /* bits 23-16 -> dst[9..16] */
-    memcpy(dst + 17, &lut_lrck0[L[1]], 8);   /* bits 15-8  -> dst[17..24] */
-    memcpy(dst + 25, &lut_lrck0[L[0]], 8);   /* bits 7-0   -> dst[25..32] (overwrites dst[32]) */
-
-    /* Right channel (LRCK=1): dst[32]=padding, dst[33..63]=31 data bits */
-    dst[32] = 0x01;                            /* fix overwrite from above */
-    memcpy(dst + 33, &lut_lrck1[R[3]], 8);   /* bits 31-24 */
-    memcpy(dst + 41, &lut_lrck1[R[2]], 8);   /* bits 23-16 */
-    memcpy(dst + 49, &lut_lrck1[R[1]], 8);   /* bits 15-8 */
-    memcpy(dst + 57, &lut_lrck1[R[0]], 8);   /* bits 7-0 -> dst[57..64] */
-    /* dst[64] is next frame's byte 0, which will be overwritten. Last frame in
-     * buffer may write 1 byte past the buffer; allocate 1 extra byte. */
-}
-
-/*
- * Generic encoder for non-standard configurations (TDM, multi-line, etc.)
- */
-static void IRAM_ATTR encode_frame_generic(struct parlio_i2s_tx *h,
-                                            uint8_t *dst,
-                                            const int32_t *samples)
-{
-    const uint16_t bpf = h->bclk_per_frame;
     const uint8_t  sw  = h->slot_width;
     const uint8_t  bps = h->bits_per_sample;
     const uint8_t  ndl = h->num_data_lines;
     const uint8_t  ns  = h->num_slots;
     const bool     is_std = (h->mode == PARLIO_I2S_MODE_STANDARD);
 
-    /* Split loop by slot to eliminate division/modulo */
-    for (uint8_t slot = 0; slot < ns; slot++) {
-        uint8_t lrck;
+    /* Number of data bits to encode per slot (limited by slot width - 1 offset) */
+    /* Handle silence (NULL samples) first */
+    if (!samples) {
+        memset(dst, 0, h->bclk_per_frame);
         if (is_std) {
-            lrck = (slot >= 1) ? 1 : 0;
+            for (uint16_t p = sw; p < h->bclk_per_frame; p++)
+                dst[p] = 0x01;
         } else {
-            lrck = (slot == 0) ? 1 : 0; /* TDM: frame sync on first slot only */
+            dst[0] = 0x01;
         }
+        return;
+    }
 
+    const uint8_t data_bits = (bps < sw) ? bps : (sw - 1);
+    const uint8_t full_groups = data_bits / 8;
+    const uint8_t remainder   = data_bits % 8;
+
+    for (uint8_t slot = 0; slot < ns; slot++) {
         uint16_t base = slot * sw;
-        /* Padding byte (1-BCLK offset) */
-        dst[base] = lrck & 1;
 
-        /* Data bits: pos_in_slot 1..min(bps, sw-1) */
-        uint8_t max_bits = (bps < sw) ? bps : (sw - 1);
-        for (uint8_t bi = 0; bi < max_bits; bi++) {
-            uint16_t data_bits = 0;
-            if (samples) {
-                for (uint8_t line = 0; line < ndl; line++) {
-                    int32_t samp = samples[line * ns + slot];
-                    data_bits |= (((uint32_t)samp >> (31 - bi)) & 1) << line;
-                }
+        /* LRCK / frame sync byte (padding, no data) */
+        uint8_t lrck_val;
+        if (is_std) {
+            lrck_val = (slot >= 1) ? 1 : 0;
+        } else {
+            /* TDM: frame sync high only at bclk==0 (= slot 0, pos 0) */
+            lrck_val = (slot == 0) ? 1 : 0;
+        }
+        dst[base] = lrck_val;
+
+        /* Encode data bits 8 at a time via LUT */
+        uint8_t *out = dst + base + 1;
+
+        for (uint8_t g = 0; g < full_groups; g++) {
+            uint64_t combined = 0;
+            for (uint8_t line = 0; line < ndl; line++) {
+                /* Sample bytes: little-endian, MSByte = offset 3 */
+                const uint8_t *sbytes = (const uint8_t *)&samples[line * ns + slot];
+                uint8_t byte_val = sbytes[3 - g]; /* MSB first: group 0 = byte[3] */
+                combined |= line_lut[line][byte_val];
             }
-            dst[base + 1 + bi] = (lrck & 1) | (uint8_t)(data_bits << 1);
+            /* OR in LRCK for standard I2S (LRCK is constant across entire slot) */
+            if (lrck_val) combined |= lrck_mask;
+            memcpy(out + g * 8, &combined, 8);
         }
 
-        /* Remaining padding (if slot_width > bits_per_sample + 1) */
-        for (uint16_t p = max_bits + 1; p < sw; p++) {
-            dst[base + p] = lrck & 1;
-        }
-
-        /* TDM: frame sync is only high for bclk==0, rest of first slot is low */
-        if (!is_std && slot == 0) {
-            for (uint16_t p = 1; p < sw; p++) {
-                dst[base + p] = (dst[base + p] & 0xFE); /* clear LRCK bit */
+        /* Handle remaining bits (< 8) */
+        if (remainder > 0) {
+            uint64_t combined = 0;
+            for (uint8_t line = 0; line < ndl; line++) {
+                const uint8_t *sbytes = (const uint8_t *)&samples[line * ns + slot];
+                uint8_t byte_val = sbytes[3 - full_groups];
+                combined |= line_lut[line][byte_val];
             }
-            /* But we already set lrck=1 only for the padding byte dst[0].
-             * Actually for TDM, lrck=1 at bclk==0 only. In our slot loop,
-             * lrck is set per slot. For slot 0, all bytes have lrck=1.
-             * We need to fix: only dst[0] should have lrck=1. */
-            /* Rewrite: for TDM slot 0, only first byte gets lrck=1 */
+            if (lrck_val) combined |= lrck_mask;
+            /* Write only 'remainder' bytes */
+            uint8_t *src = (uint8_t *)&combined;
+            for (uint8_t r = 0; r < remainder; r++)
+                out[full_groups * 8 + r] = src[r];
+        }
+
+        /* Zero-pad rest of slot (if slot_width > data_bits + 1) */
+        uint16_t data_end = 1 + data_bits;
+        for (uint16_t p = data_end; p < sw; p++)
+            dst[base + p] = lrck_val;
+
+        /* TDM: LRCK was set for entire slot 0, but should only be high at bclk==0.
+         * Clear it from all bytes except the padding byte. */
+        if (!is_std && slot == 0 && lrck_val) {
+            for (uint16_t p = 1; p < sw; p++)
+                dst[base + p] &= ~0x01;
         }
     }
 
-    /* TDM fix: clear LRCK on all bytes except bclk==0 */
-    if (!is_std) {
-        /* dst[0] already has lrck=1 (set above). Clear it from the rest of slot 0 */
-        for (uint16_t p = 1; p < sw; p++) {
-            dst[p] &= 0xFE;
-        }
-    }
-}
-
-/* Dispatch to appropriate encoder */
-static inline void IRAM_ATTR encode_frame(struct parlio_i2s_tx *h,
-                                           uint8_t *dst,
-                                           const int32_t *samples)
-{
-    if (h->mode == PARLIO_I2S_MODE_STANDARD && h->num_data_lines == 1 &&
-        h->bits_per_sample == 32 && h->slot_width == 32 && h->parlio_width == 8) {
-        encode_frame_lut(dst,
-                         samples ? samples[0] : 0,
-                         samples ? samples[1] : 0);
-    } else {
-        encode_frame_generic(h, dst, samples);
-    }
 }
 
 static bool IRAM_ATTR on_parlio_tx_done(parlio_tx_unit_handle_t tx_unit,
@@ -303,8 +292,8 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     uint8_t pw = next_parlio_width(1 + config->num_data_lines);
     ESP_RETURN_ON_FALSE(pw > 0 && pw <= 16, ESP_ERR_INVALID_ARG, TAG, "too many data lines");
 
-    /* Initialize LUT for fast encoding */
-    init_bit_lut();
+    /* Initialize per-line LUTs for fast encoding */
+    init_line_luts(config->num_data_lines);
 
     struct parlio_i2s_tx *h = calloc(1, sizeof(*h));
     ESP_RETURN_ON_FALSE(h, ESP_ERR_NO_MEM, TAG, "alloc handle");
