@@ -23,7 +23,7 @@ static const char *TAG = "audio_demo";
 
 #define SAMPLE_RATE    48000
 #define TEST_SECONDS   30
-#define FRAMES_PER_BUF 4096
+#define FRAMES_PER_BUF 128
 
 static uint32_t ramp_inc(uint32_t freq_hz)
 {
