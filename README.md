@@ -225,6 +225,40 @@ Output latency = `frames_per_buffer * 3 / sample_rate` (3 rotating DMA buffers).
 
 All signals (BCLK, LRCK, data lines) are in the same PARLIO clock domain, phase-aligned to within a single MCLK period (< 100 ns).
 
+## Clock Outputs for External DACs
+
+All clocks needed by external DAC chips are available on GPIO pins:
+
+```
+  mclk_gpio -----> MCLK  (from APLL via I2S, always available)
+                   Also serves as PARLIO ext clock input (same pin, GPIO matrix)
+
+  Standalone I2S driver:
+    clk_out_gpio --> BCLK  (dedicated PARLIO clock output)
+    TXD[0] -------> LRCK  (word select / frame sync)
+
+  Unified multi-protocol driver:
+    clk_out_gpio --> PARLIO clock (= BCLK in I2S-only mode,
+                     = 256*Fs when ADAT active, usable as MCLK)
+    TXD[N] -------> BCLK  (synthesized on data line in multi-protocol mode)
+    TXD[N+1] -----> LRCK
+```
+
+No additional hardware is needed to clock external DACs -- connect `mclk_gpio` to the DAC's MCLK input, `bclk_gpio` to BCK, and `lrck_gpio` to LRCK/WS.
+
+### Clock Compatibility Notes
+
+When combining protocols, the PARLIO clock must be the highest protocol's rate:
+- **I2S only**: PARLIO clock = BCLK = `slot_width * num_slots * Fs`
+- **S/PDIF present**: PARLIO clock >= 128 * Fs
+- **ADAT present**: PARLIO clock >= 256 * Fs
+
+The `mclk_multiple` must be an integer multiple of `parlio_clock / Fs`. The driver validates this at init and returns `ESP_ERR_INVALID_ARG` with a descriptive message if:
+- `mclk_multiple` is too small for the configured protocols
+- `mclk_multiple` doesn't divide evenly by the BCLK-per-frame count
+- The resulting MCLK exceeds the APLL's maximum (~50 MHz)
+- I2S BCLK rate doesn't divide evenly into the PARLIO clock (multi-protocol mode)
+
 ## Slot Width and BCLK Rate
 
 The `slot_width` parameter controls BCLK cycles per slot. Some codecs expect more BCLK than the sample width:

@@ -616,11 +616,29 @@ esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
     }
     ESP_RETURN_ON_FALSE(mclk_mult >= ticks_per_frame,
                         ESP_ERR_INVALID_ARG, TAG,
-                        "mclk_multiple (%u) < ticks_per_frame (%u)", mclk_mult, ticks_per_frame);
+                        "mclk_multiple (%u) too small for configured protocols "
+                        "(need >= %u: %s%s%s)",
+                        mclk_mult, ticks_per_frame,
+                        config->i2s ? "I2S " : "",
+                        config->spdif ? "SPDIF(128x) " : "",
+                        config->adat ? "ADAT(256x)" : "");
     ESP_RETURN_ON_FALSE(mclk_mult % ticks_per_frame == 0,
                         ESP_ERR_INVALID_ARG, TAG,
-                        "mclk_multiple (%u) not divisible by ticks_per_frame (%u)",
+                        "mclk_multiple (%u) not evenly divisible by ticks_per_frame (%u)",
                         mclk_mult, ticks_per_frame);
+
+    /* Check APLL frequency limit (~50 MHz max) */
+    uint32_t mclk_hz = (uint32_t)mclk_mult * fs;
+    if (mclk_hz > 50000000) {
+        ESP_LOGE(TAG, "MCLK = %"PRIu32" Hz exceeds APLL max (~50 MHz). "
+                 "Reduce mclk_multiple (%u) or sample_rate (%"PRIu32")",
+                 mclk_hz, mclk_mult, fs);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (mclk_hz > 40000000) {
+        ESP_LOGW(TAG, "MCLK = %"PRIu32" Hz is near APLL limit. "
+                 "Some frequencies may not be achievable precisely", mclk_hz);
+    }
 
     /* --- Allocate handle --- */
     struct parlio_audio_tx *h = calloc(1, sizeof(*h));

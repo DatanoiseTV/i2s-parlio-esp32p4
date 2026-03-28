@@ -312,7 +312,23 @@ esp_err_t parlio_i2s_tx_new(const parlio_i2s_tx_config_t *config,
     h->bclk_freq       = (uint32_t)h->bclk_per_frame * config->sample_rate;
 
     uint32_t ratio = mclk_mult / h->bclk_per_frame;
-    ESP_RETURN_ON_FALSE(ratio >= 1, ESP_ERR_INVALID_ARG, TAG, "MCLK/BCLK < 1");
+    ESP_RETURN_ON_FALSE(ratio >= 1, ESP_ERR_INVALID_ARG, TAG,
+                        "mclk_multiple (%u) too small, need >= %u for %u slots x %u-bit",
+                        mclk_mult, h->bclk_per_frame, num_slots, slot_w);
+
+    /* APLL frequency limit check */
+    if (h->mclk_freq > 50000000) {
+        ESP_LOGE(TAG, "MCLK = %"PRIu32" Hz exceeds APLL max (~50 MHz). "
+                 "Reduce mclk_multiple (%u) or sample_rate (%"PRIu32"). "
+                 "Min mclk_multiple for this config = %u",
+                 h->mclk_freq, mclk_mult, config->sample_rate, h->bclk_per_frame);
+        free(h);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (h->mclk_freq > 40000000) {
+        ESP_LOGW(TAG, "MCLK = %"PRIu32" Hz is near APLL limit (~50 MHz). "
+                 "Some frequencies may round to nearby values", h->mclk_freq);
+    }
     ESP_RETURN_ON_FALSE((mclk_mult % h->bclk_per_frame) == 0, ESP_ERR_INVALID_ARG, TAG,
                         "mclk_multiple not divisible by slot_width*num_slots");
 
