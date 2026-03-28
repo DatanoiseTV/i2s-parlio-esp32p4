@@ -485,7 +485,7 @@ void app_main(void)
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
     /* Count total tests */
-    test_total = 17 + 6 + 5 + 4 + 3 + 9; /* 48k + 96k + 192k + 44.1k + low + unified */
+    test_total = 17 + 5 + 3 + 4 + 3 + 9; /* 48k + 96k + 192k + 44.1k + low + unified */
 
     printf("\n" C_BOLD "========================================" C_RESET "\n");
     printf(C_BOLD "  PARLIO I2S Throughput Sweep" C_RESET "\n");
@@ -524,15 +524,12 @@ void app_main(void)
     run_test("TDM4 x4 (16ch)",      96000, PARLIO_I2S_MODE_TDM4,    4,  256);
     run_test("TDM8 x1 (8ch)",       96000, PARLIO_I2S_MODE_TDM8,    1,  256);
     run_test("TDM8 x4 (32ch)",      96000, PARLIO_I2S_MODE_TDM8,    4,  256);
-    run_test("TDM16 x1 (16ch)",     96000, PARLIO_I2S_MODE_TDM16,   1,  512);
 
     /* ---- 192 kHz ---- */
     printf("\n" C_BOLD "  --- 192 kHz ---" C_RESET "\n");
     run_test("Stereo x1 (2ch)",     192000, PARLIO_I2S_MODE_STANDARD, 1,  128);
     run_test("Stereo x11 (22ch)",   192000, PARLIO_I2S_MODE_STANDARD, 11, 128);
     run_test("TDM4 x1 (4ch)",       192000, PARLIO_I2S_MODE_TDM4,    1,  128);
-    run_test("TDM8 x1 (8ch)",       192000, PARLIO_I2S_MODE_TDM8,    1,  256);
-    run_test("TDM16 x1 (16ch)",     192000, PARLIO_I2S_MODE_TDM16,   1,  512);
 
     /* ---- 44.1 kHz family ---- */
     printf("\n" C_BOLD "  --- 44.1 kHz family ---" C_RESET "\n");

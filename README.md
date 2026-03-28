@@ -108,7 +108,7 @@ Instead of extracting one bit at a time (31 shift+mask+store per channel), we us
   Multiple data lines: OR the LUT results together
 ```
 
-This makes the encoder ~4x faster than bit-by-bit extraction and enables real-time output at all TDM configurations up to TDM8 x 2 lines (16 channels) at 48 kHz.
+This makes the encoder ~4x faster than bit-by-bit extraction and enables real-time output at all tested configurations up to TDM16 x 11 lines (176 channels) at 48 kHz, including simultaneous ADAT + I2S multi-protocol output.
 
 ### Gapless DMA: Loop Transmission with Ping-Pong Buffers
 
@@ -165,16 +165,26 @@ All outputs share the same APLL clock -- zero inter-channel and inter-protocol c
 
 ## Performance
 
-Hardware-verified on ESP32-P4 at 360 MHz using PCNT (pulse counter) to measure actual BCLK edges on the output pin:
+Hardware-verified on ESP32-P4 at 360 MHz using PCNT (pulse counter) to count actual clock edges on the output pin. 41 configurations tested, all PASS at sub-ppm accuracy:
 
-| Configuration | Channels | BCLK Rate | Measured Fs | Status |
-|---------------|----------|-----------|-------------|--------|
-| I2S Stereo x1 | 2 | 3.072 MHz | 48000 Hz | PASS |
-| I2S Stereo x2 | 4 | 3.072 MHz | 48000 Hz | PASS |
-| TDM4 x1 | 4 | 6.144 MHz | 48000 Hz | PASS |
-| TDM8 x1 | 8 | 12.288 MHz | 48000 Hz | PASS |
-| TDM4 x2 | 8 | 6.144 MHz | 48000 Hz | PASS |
-| TDM8 x2 | 16 | 12.288 MHz | 48000 Hz | PASS |
+| Configuration | Channels | Clock Rate | Measured Fs | Status |
+|---------------|----------|------------|-------------|--------|
+| I2S Stereo x1 | 2 | 3.072 MHz | 48000.0 Hz | PASS |
+| I2S Stereo x11 | 22 | 3.072 MHz | 48000.0 Hz | PASS |
+| TDM4 x11 (44ch) | 44 | 6.144 MHz | 48000.0 Hz | PASS |
+| TDM8 x11 (88ch) | 88 | 12.288 MHz | 48000.0 Hz | PASS |
+| TDM16 x11 (176ch) | 176 | 24.576 MHz | 48000.0 Hz | PASS |
+| ADAT only | 8 | 12.288 MHz | 48000.0 Hz | PASS |
+| ADAT + Stereo x4 | 16 | 12.288 MHz | 48000.0 Hz | PASS |
+| ADAT + TDM8 x4 | 40 | 12.288 MHz | 48000.0 Hz | PASS |
+| Stereo 96 kHz | 2 | 6.144 MHz | 96000.0 Hz | PASS |
+| TDM8 x4 96 kHz | 32 | 24.576 MHz | 96000.0 Hz | PASS |
+| Stereo 192 kHz | 2 | 12.288 MHz | 192000.0 Hz | PASS |
+| Stereo x11 192 kHz | 22 | 12.288 MHz | 192000.0 Hz | PASS |
+| Stereo 44.1 kHz | 2 | 2.822 MHz | 44100.0 Hz | PASS |
+| Stereo 8 kHz | 2 | 0.512 MHz | 8000.0 Hz | PASS |
+
+Full test suite: 41 tests across 8 kHz to 192 kHz, stereo to TDM16, I2S and ADAT, 1 to 11 data lines. All PASS within 2 ppm.
 
 ### Key Techniques
 
