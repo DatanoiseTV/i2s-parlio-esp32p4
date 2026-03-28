@@ -249,7 +249,7 @@ Requires ESP-IDF v5.4+ with ESP32-P4 support.
 
 - `parlio_audio_tx.h` -- any combination of I2S + S/PDIF + ADAT + I2S HW passthrough
 
-### Quick Example
+### Example 1: Standalone TDM8 (16 channels)
 
 ```c
 parlio_i2s_tx_config_t cfg = {
@@ -274,6 +274,138 @@ parlio_i2s_tx_enable(tx);
 int32_t samples[16];
 size_t written;
 parlio_i2s_tx_write(tx, samples, 1, &written, 1000);
+```
+
+### Example 2: ADAT + Stereo I2S (10 channels, unified driver)
+
+8 channels via ADAT optical + 2 channels via I2S, all sample-locked:
+
+```c
+parlio_audio_i2s_config_t i2s_cfg = {
+    .mode = PARLIO_AUDIO_I2S_STANDARD,
+    .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 1,
+    .bclk_gpio = GPIO_NUM_24, .lrck_gpio = GPIO_NUM_25,
+    .data_gpios = { GPIO_NUM_32 },
+};
+parlio_audio_adat_config_t adat_cfg = { .adat_gpio = GPIO_NUM_33 };
+
+parlio_audio_tx_config_t cfg = {
+    .sample_rate = 48000, .mclk_multiple = 512,
+    .mclk_gpio = GPIO_NUM_21, .clk_out_gpio = GPIO_NUM_22,
+    .i2s = &i2s_cfg, .adat = &adat_cfg,
+};
+
+parlio_audio_tx_handle_t tx;
+parlio_audio_tx_new(&cfg, &tx);
+parlio_audio_tx_enable(tx);
+
+/* 10 samples per frame: [I2S_L, I2S_R, ADAT_ch0..ch7] */
+int32_t frame[10];
+parlio_audio_tx_write(tx, frame, 1, NULL, 1000);
+```
+
+### Example 3: S/PDIF + ADAT + I2S (14 channels, all three protocols)
+
+2 channels S/PDIF + 8 channels ADAT + 4 channels I2S stereo, simultaneously:
+
+```c
+parlio_audio_i2s_config_t i2s_cfg = {
+    .mode = PARLIO_AUDIO_I2S_STANDARD,
+    .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 2,
+    .bclk_gpio = GPIO_NUM_24, .lrck_gpio = GPIO_NUM_25,
+    .data_gpios = { GPIO_NUM_32, GPIO_NUM_33 },
+};
+parlio_audio_spdif_config_t spdif_cfg = {
+    .bits_per_sample = 24, .consumer_format = true,
+    .spdif_gpio = GPIO_NUM_36,
+};
+parlio_audio_adat_config_t adat_cfg = { .adat_gpio = GPIO_NUM_45 };
+
+parlio_audio_tx_config_t cfg = {
+    .sample_rate = 48000, .mclk_multiple = 512,
+    .mclk_gpio = GPIO_NUM_21, .clk_out_gpio = GPIO_NUM_22,
+    .i2s = &i2s_cfg, .spdif = &spdif_cfg, .adat = &adat_cfg,
+};
+
+parlio_audio_tx_handle_t tx;
+parlio_audio_tx_new(&cfg, &tx);
+parlio_audio_tx_enable(tx);
+
+/* 14 samples per frame: [I2S_L0, I2S_R0, I2S_L1, I2S_R1, SPDIF_L, SPDIF_R, ADAT_0..7] */
+size_t frame_size = parlio_audio_tx_get_frame_size(tx); /* = 14 */
+int32_t frame[14];
+parlio_audio_tx_write(tx, frame, 1, NULL, 1000);
+```
+
+### Example 4: S/PDIF only (2 channels, standalone driver)
+
+```c
+parlio_spdif_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .bits_per_sample = 24,
+    .mclk_multiple = 256,
+    .mclk_gpio = GPIO_NUM_21,
+    .spdif_gpio = GPIO_NUM_22,
+    .consumer_format = true,
+};
+
+parlio_spdif_tx_handle_t spdif;
+parlio_spdif_tx_new(&cfg, &spdif);
+parlio_spdif_tx_enable(spdif);
+
+int32_t stereo[2] = { left, right };
+parlio_spdif_tx_write(spdif, stereo, 1, NULL, 1000);
+```
+
+### Example 5: ADAT only (8 channels, standalone driver)
+
+```c
+parlio_adat_tx_config_t cfg = {
+    .sample_rate = 48000,
+    .mclk_multiple = 512,
+    .mclk_gpio = GPIO_NUM_21,
+    .adat_gpio = GPIO_NUM_22,
+};
+
+parlio_adat_tx_handle_t adat;
+parlio_adat_tx_new(&cfg, &adat);
+parlio_adat_tx_enable(adat);
+
+int32_t frame[8] = { ch0, ch1, ch2, ch3, ch4, ch5, ch6, ch7 };
+parlio_adat_tx_write(adat, frame, 1, NULL, 1000);
+```
+
+### Example 6: I2S HW passthrough (bonus output from clock generator)
+
+The I2S peripheral used for APLL clock generation can also output real audio:
+
+```c
+parlio_audio_i2s_hw_config_t hw_cfg = {
+    .bits_per_sample = 32,
+    .total_slots = 8,                   /* TDM8 on the I2S HW peripheral */
+    .bclk_gpio = GPIO_NUM_46,
+    .ws_gpio   = GPIO_NUM_47,
+    .dout_gpio = GPIO_NUM_48,
+    .dout2_gpio = -1,
+};
+
+parlio_audio_tx_config_t cfg = {
+    .sample_rate = 48000, .mclk_multiple = 512,
+    .mclk_gpio = GPIO_NUM_21, .clk_out_gpio = GPIO_NUM_22,
+    .adat = &adat_cfg,      /* 8 ch ADAT via PARLIO */
+    .i2s_hw = &hw_cfg,      /* 8 ch TDM via I2S HW (free, same APLL) */
+};
+
+parlio_audio_tx_handle_t tx;
+parlio_audio_tx_new(&cfg, &tx);
+parlio_audio_tx_enable(tx);
+
+/* ADAT: write via PARLIO path */
+parlio_audio_tx_write(tx, adat_samples, num_frames, NULL, 1000);
+
+/* I2S HW: write via standard ESP-IDF API (sample-locked with PARLIO) */
+i2s_chan_handle_t hw = parlio_audio_tx_get_i2s_hw_handle(tx);
+i2s_channel_write(hw, tdm_samples, size, &bytes_written, 1000);
 ```
 
 ## Benchmarks
