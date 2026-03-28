@@ -404,44 +404,29 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
     handle->write_buf_idx = 0;
     handle->write_frame_pos = 0;
 
-    /* Pre-fill both ping-pong buffers with silence and start loop mode.
-     * Loop mode uses DMA descriptor chaining -- when we submit a new buffer
-     * via transmit(loop=true), the DMA seamlessly chains to it with zero gap.
-     * The tx_done callback fires each time a buffer loop completes (= swap point). */
-    for (int b = 0; b < 2 && b < (int)handle->dma_buf_count; b++) {
+    /* Pre-fill all buffers with silence and queue them.
+     * The PARLIO ISR auto-starts the next queued transaction on EOF,
+     * so keeping the queue fed minimizes inter-buffer gaps. */
+    for (size_t i = 0; i < handle->dma_buf_count; i++) {
         for (size_t f = 0; f < handle->frames_per_buf; f++) {
-            uint8_t *p = handle->dma_bufs[b] + f * handle->frame_buf_bytes;
+            uint8_t *p = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
             encode_frame(handle, p, NULL);
         }
+        parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
+        ESP_RETURN_ON_ERROR(
+            parlio_tx_unit_transmit(handle->parlio_unit,
+                                    handle->dma_bufs[i],
+                                    handle->dma_buf_bytes * 8,
+                                    &tx_cfg),
+            TAG, "initial silence transmit failed");
+        xSemaphoreTake(handle->write_sem, 0);
     }
-
-    /* Start loop playback of buf[0]. DMA will repeat this until we swap. */
-    parlio_transmit_config_t tx_cfg = {
-        .idle_value = 0,
-        .flags.loop_transmission = 1,
-    };
-    ESP_RETURN_ON_ERROR(
-        parlio_tx_unit_transmit(handle->parlio_unit,
-                                handle->dma_bufs[0],
-                                handle->dma_buf_bytes * 8,
-                                &tx_cfg),
-        TAG, "initial loop transmit failed");
-
-    /* Encoder starts writing into buf[1]. When done, it swaps via loop transmit.
-     * The semaphore is used as a binary signal: tx_done means the swap completed
-     * and the previous buffer is free for reuse. Start with 1 slot available
-     * (buf[1] is free to write). */
-    xSemaphoreGive(handle->write_sem); /* ensure exactly 1 slot available */
-    /* Drain any extra counts from init */
-    while (xSemaphoreTake(handle->write_sem, 0) == pdTRUE) {}
-    xSemaphoreGive(handle->write_sem); /* exactly 1 */
-    handle->write_buf_idx = 1;
 
     const char *mode_str =
         (handle->mode == PARLIO_I2S_MODE_STANDARD) ? "I2S" :
         (handle->mode == PARLIO_I2S_MODE_TDM4) ? "TDM4" :
         (handle->mode == PARLIO_I2S_MODE_TDM8) ? "TDM8" : "TDM16";
-    ESP_LOGI(TAG, "TX enabled (loop DMA): %s, Fs=%"PRIu32", %u-bit, %u ch (%u lines x %u slots)",
+    ESP_LOGI(TAG, "TX enabled: %s, Fs=%"PRIu32", %u-bit, %u ch (%u lines x %u slots)",
              mode_str, handle->sample_rate, handle->bits_per_sample,
              handle->num_slots * handle->num_data_lines,
              handle->num_data_lines, handle->num_slots);
@@ -495,21 +480,18 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
         handle->write_frame_pos++;
         written++;
 
-        /* Buffer full: swap into loop DMA (seamless, zero gap) */
+        /* Buffer full: submit and advance. The ISR auto-starts the next
+         * queued transfer, so keeping the queue fed minimizes gaps. */
         if (handle->write_frame_pos >= handle->frames_per_buf) {
-            parlio_transmit_config_t tx_cfg = {
-                .idle_value = 0,
-                .flags.loop_transmission = 1,
-            };
+            parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
             esp_err_t ret = parlio_tx_unit_transmit(
                 handle->parlio_unit,
                 handle->dma_bufs[handle->write_buf_idx],
                 handle->dma_buf_bytes * 8,
                 &tx_cfg);
-            ESP_RETURN_ON_ERROR(ret, TAG, "loop transmit failed");
+            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
 
-            /* Ping-pong: alternate between buf[0] and buf[1] */
-            handle->write_buf_idx ^= 1;
+            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
             handle->write_frame_pos = 0;
         }
     }
