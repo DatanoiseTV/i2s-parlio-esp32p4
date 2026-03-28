@@ -32,6 +32,8 @@ static const char *TAG = "audio_test";
 #define TEST_SECONDS   5
 #define FRAMES_PER_BUF 128
 #define MAX_RESULTS    40
+static int test_num = 0;
+static int test_total = 0;
 
 #define C_GREEN  "\033[32m"
 #define C_YELLOW "\033[33m"
@@ -130,8 +132,10 @@ static void run_test(const char *label, uint32_t sample_rate,
     int num_channels = num_data_lines * num_slots;
     uint32_t bclk = (uint32_t)32 * num_slots * sample_rate;
 
-    printf("  %-26s %6"PRIu32" Hz  %3d ch  BCLK=%7.3f MHz  ",
-           label, sample_rate, num_channels, bclk / 1e6f);
+    test_num++;
+    printf("\n  " C_BOLD "[%2d/%d]" C_RESET " %-24s  %6"PRIu32" Hz  %3d ch  BCLK=%.3f MHz\n",
+           test_num, test_total, label, sample_rate, num_channels, bclk / 1e6f);
+    printf("         ");
     fflush(stdout);
 
     /* Adaptive frames_per_buffer: reduce for high channel counts to fit in RAM.
@@ -162,7 +166,7 @@ static void run_test(const char *label, uint32_t sample_rate,
     parlio_i2s_tx_handle_t tx = NULL;
     esp_err_t err = parlio_i2s_tx_new(&cfg, &tx);
     if (err != ESP_OK) {
-        printf(C_RED "SKIP (%s)" C_RESET "\n", esp_err_to_name(err));
+        printf(C_YELLOW "SKIP" C_RESET " -- %s\n", esp_err_to_name(err));
         if (num_results < MAX_RESULTS) {
             result_t *r = &results[num_results++];
             snprintf(r->label, sizeof(r->label), "%s", label);
@@ -191,7 +195,12 @@ static void run_test(const char *label, uint32_t sample_rate,
     pcnt_unit_start(pcnt);
     int64_t t_start = esp_timer_get_time();
 
-    vTaskDelay(pdMS_TO_TICKS(TEST_SECONDS * 1000));
+    /* Progress dots during measurement */
+    for (int s = 0; s < TEST_SECONDS; s++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        printf(".");
+        fflush(stdout);
+    }
 
     pcnt_unit_stop(pcnt);
     int final_count = 0;
@@ -218,8 +227,8 @@ static void run_test(const char *label, uint32_t sample_rate,
         color = C_RED; status = "NO CLK";
     }
 
-    printf("Fs=%7.1f (%+5.0f ppm) SW=%7.0f  [%s%s%s]\n",
-           hw_fs, err_ppm, sw_fs, color, status, C_RESET);
+    printf(" %s%s%s  HW=%.1f Hz (%+.0f ppm)  SW=%.0f Hz\n",
+           color, status, C_RESET, hw_fs, err_ppm, sw_fs);
 
     if (num_results < MAX_RESULTS) {
         result_t *r = &results[num_results++];
@@ -243,10 +252,12 @@ static void run_test(const char *label, uint32_t sample_rate,
 static void print_summary(void)
 {
     printf("\n");
-    printf(C_BOLD "=== EXECUTIVE SUMMARY ===" C_RESET "\n");
-    printf("%-26s %7s  %3s  %9s  %7s  %6s  %s\n",
-           "Configuration", "Fs", "Ch", "HW Fs", "Error", "SW Fs", "Status");
-    printf("------------------------------------------------------------------------\n");
+    printf(C_BOLD "========================================" C_RESET "\n");
+    printf(C_BOLD "  EXECUTIVE SUMMARY" C_RESET "\n");
+    printf(C_BOLD "========================================" C_RESET "\n\n");
+    printf("  %-24s %7s  %3s  %10s  %7s  %s\n",
+           "Configuration", "Target", "Ch", "Measured", "Error", "");
+    printf("  --------------------------------------------------------------------------\n");
 
     int pass = 0, ok = 0, fail = 0, skip = 0;
     for (int i = 0; i < num_results; i++) {
@@ -258,24 +269,22 @@ static void print_summary(void)
         else { color = C_RED; fail++; }
 
         if (r->hw_fs > 0) {
-            printf("%-26s %6"PRIu32"  %3d  %9.1f  %+5.0fppm  %7.0f  %s%s%s\n",
+            printf("  %-24s %6"PRIu32"  %3d  %9.1f Hz  %+5.0fppm  %s%4s%s\n",
                    r->label, r->sample_rate, r->channels,
-                   r->hw_fs, r->err_ppm, r->sw_fs,
-                   color, r->status, C_RESET);
+                   r->hw_fs, r->err_ppm, color, r->status, C_RESET);
         } else {
-            printf("%-26s %6"PRIu32"  %3d  %9s  %7s  %7s  %s%s%s\n",
+            printf("  %-24s %6"PRIu32"  %3d  %9s     %7s  %s%4s%s\n",
                    r->label, r->sample_rate, r->channels,
-                   "--", "--", "--",
-                   color, r->status, C_RESET);
+                   "--", "--", color, r->status, C_RESET);
         }
     }
 
-    printf("------------------------------------------------------------------------\n");
-    printf("Total: %d tests | ", num_results);
-    if (pass > 0) printf(C_GREEN "%d PASS" C_RESET " ", pass);
-    if (ok > 0)   printf(C_YELLOW "%d OK" C_RESET " ", ok);
-    if (fail > 0) printf(C_RED "%d FAIL" C_RESET " ", fail);
-    if (skip > 0) printf(C_YELLOW "%d SKIP" C_RESET " ", skip);
+    printf("  --------------------------------------------------------------------------\n");
+    printf("  %d tests: ", num_results);
+    if (pass > 0) printf(C_GREEN "%d PASS" C_RESET "  ", pass);
+    if (ok > 0)   printf(C_YELLOW "%d OK" C_RESET "  ", ok);
+    if (fail > 0) printf(C_RED "%d FAIL" C_RESET "  ", fail);
+    if (skip > 0) printf(C_YELLOW "%d SKIP" C_RESET "  ", skip);
     printf("\n\n");
 }
 
@@ -291,14 +300,21 @@ void app_main(void)
     esp_log_level_set("parlio", ESP_LOG_ERROR);
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
-    printf("\n" C_BOLD "=== PARLIO I2S Throughput Sweep (PCNT-verified, %ds/test) ===" C_RESET "\n", TEST_SECONDS);
-    printf("  MCLK=%d BCLK=%d LRCK=%d\n", PIN_MCLK, PIN_BCLK, PIN_LRCK);
-    printf("  DATA: %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d (11 lines, max 176ch)\n\n",
+    /* Count total tests */
+    test_total = 17 + 6 + 5 + 4 + 3; /* 48k + 96k + 192k + 44.1k + low */
+
+    printf("\n" C_BOLD "========================================" C_RESET "\n");
+    printf(C_BOLD "  PARLIO I2S Throughput Sweep" C_RESET "\n");
+    printf(C_BOLD "  PCNT-verified, %ds per test" C_RESET "\n", TEST_SECONDS);
+    printf(C_BOLD "========================================" C_RESET "\n\n");
+    printf("  MCLK=GPIO%d  BCLK=GPIO%d  LRCK=GPIO%d\n", PIN_MCLK, PIN_BCLK, PIN_LRCK);
+    printf("  DATA[0..10]: GPIO %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
            PIN_DATA0, PIN_DATA1, PIN_DATA2, PIN_DATA3, PIN_DATA4,
            PIN_DATA5, PIN_DATA6, PIN_DATA7, PIN_DATA8, PIN_DATA9, PIN_DATA10);
+    printf("  11 data lines = max 176 channels (TDM16 x 11)\n");
 
     /* ---- 48 kHz: scaling data lines ---- */
-    printf(C_BOLD "  -- 48 kHz: channel scaling --" C_RESET "\n");
+    printf("\n" C_BOLD "  --- 48 kHz: channel scaling ---" C_RESET "\n");
     run_test("Stereo x1 (2ch)",     48000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo x4 (8ch)",     48000, PARLIO_I2S_MODE_STANDARD, 4,  256);
     run_test("Stereo x7 (14ch)",    48000, PARLIO_I2S_MODE_STANDARD, 7,  256);
@@ -318,7 +334,7 @@ void app_main(void)
     run_test("TDM16 x11 (176ch)",   48000, PARLIO_I2S_MODE_TDM16,   11, 1024);
 
     /* ---- 96 kHz ---- */
-    printf("\n" C_BOLD "  -- 96 kHz --" C_RESET "\n");
+    printf("\n" C_BOLD "  --- 96 kHz ---" C_RESET "\n");
     run_test("Stereo x1 (2ch)",     96000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo x11 (22ch)",   96000, PARLIO_I2S_MODE_STANDARD, 11, 256);
     run_test("TDM4 x4 (16ch)",      96000, PARLIO_I2S_MODE_TDM4,    4,  256);
@@ -327,7 +343,7 @@ void app_main(void)
     run_test("TDM16 x1 (16ch)",     96000, PARLIO_I2S_MODE_TDM16,   1,  1024);
 
     /* ---- 192 kHz ---- */
-    printf("\n" C_BOLD "  -- 192 kHz --" C_RESET "\n");
+    printf("\n" C_BOLD "  --- 192 kHz ---" C_RESET "\n");
     run_test("Stereo x1 (2ch)",     192000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo x11 (22ch)",   192000, PARLIO_I2S_MODE_STANDARD, 11, 256);
     run_test("TDM4 x1 (4ch)",       192000, PARLIO_I2S_MODE_TDM4,    1,  256);
@@ -335,14 +351,14 @@ void app_main(void)
     run_test("TDM16 x1 (16ch)",     192000, PARLIO_I2S_MODE_TDM16,   1,  1024);
 
     /* ---- 44.1 kHz family ---- */
-    printf("\n" C_BOLD "  -- 44.1 kHz family --" C_RESET "\n");
+    printf("\n" C_BOLD "  --- 44.1 kHz family ---" C_RESET "\n");
     run_test("Stereo 44.1k",        44100, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("TDM8 x4 44.1k (32ch)",44100, PARLIO_I2S_MODE_TDM8,    4,  512);
     run_test("Stereo 88.2k",        88200, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo 176.4k",      176400, PARLIO_I2S_MODE_STANDARD, 1,  256);
 
     /* ---- Low sample rates ---- */
-    printf("\n" C_BOLD "  -- Low rates --" C_RESET "\n");
+    printf("\n" C_BOLD "  --- Low sample rates ---" C_RESET "\n");
     run_test("Stereo 8kHz",          8000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo 16kHz",        16000, PARLIO_I2S_MODE_STANDARD, 1,  256);
     run_test("Stereo 32kHz",        32000, PARLIO_I2S_MODE_STANDARD, 1,  256);
