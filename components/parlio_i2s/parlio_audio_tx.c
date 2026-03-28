@@ -109,9 +109,8 @@ struct parlio_audio_tx {
 
 static uint8_t next_parlio_width(uint8_t needed)
 {
-    if (needed <= 1)  return 1;
-    if (needed <= 2)  return 2;
-    if (needed <= 4)  return 4;
+    /* Always use at least 8-bit width to avoid sub-byte bit packing
+     * in the encode loop. The unused TXD pins cost nothing. */
     if (needed <= 8)  return 8;
     if (needed <= 16) return 16;
     return 0;
@@ -364,10 +363,17 @@ static void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
             word |= (uint16_t)((adat_bits[ai >> 3] >> (ai & 7)) & 1) << adat_dbit;
         }
 
-        if (pw <= 8) {
+        /* Pack word into DMA buffer according to data_width.
+         * For width < 8: multiple words pack per byte, LSB first. */
+        if (pw == 8) {
             dst[tick] = (uint8_t)word;
-        } else {
+        } else if (pw == 16) {
             ((uint16_t *)dst)[tick] = word;
+        } else {
+            /* pw = 1, 2, or 4: pack into bytes */
+            size_t byte_pos = (tick * pw) / 8;
+            size_t bit_pos  = (tick * pw) % 8;
+            dst[byte_pos] |= (uint8_t)((word & ((1 << pw) - 1)) << bit_pos);
         }
     }
 }
@@ -570,8 +576,14 @@ esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
     h->frames_per_buf = config->frames_per_buffer ? config->frames_per_buffer : 64;
     h->dma_buf_count  = config->dma_buffer_count  ? config->dma_buffer_count  : 4;
 
-    size_t bytes_per_tick = (pw <= 8) ? 1 : 2;
-    h->frame_buf_bytes = ticks_per_frame * bytes_per_tick;
+    /* With data_width < 8, PARLIO packs multiple words per byte (LSB order).
+     * data_width=1: 8 ticks/byte, =2: 4 ticks/byte, =4: 2 ticks/byte,
+     * =8: 1 tick/byte, =16: 2 bytes/tick */
+    size_t ticks_per_byte = (pw < 8) ? (8 / pw) : 1;
+    size_t bytes_per_tick = (pw > 8) ? 2 : 1;
+    h->frame_buf_bytes = (pw <= 8)
+        ? (ticks_per_frame + ticks_per_byte - 1) / ticks_per_byte
+        : ticks_per_frame * bytes_per_tick;
     h->dma_buf_bytes   = h->frame_buf_bytes * h->frames_per_buf;
 
     h->dma_bufs = calloc(h->dma_buf_count, sizeof(uint8_t *));
