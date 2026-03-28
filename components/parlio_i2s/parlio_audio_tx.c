@@ -294,42 +294,69 @@ static void build_tick_tables(struct parlio_audio_tx *h)
 /*  Unified frame encoder (hot path, uses pre-computed tables)          */
 /* ------------------------------------------------------------------ */
 
-static void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
-                                    uint8_t *dst,
-                                    const int32_t *samples)
+/*
+ * Fast path: I2S-only encoder (no SPDIF/ADAT). Avoids all serial protocol
+ * overhead, protocol NULL checks, and struct indirection. Just table lookups
+ * and byte writes.
+ */
+static void IRAM_ATTR encode_frame_i2s_only(struct parlio_audio_tx *h,
+                                              uint8_t *dst,
+                                              const int32_t *samples)
+{
+    const uint16_t tpf = h->ticks_per_frame;
+    const int32_t *samp = samples ? samples + h->i2s_offset : NULL;
+    const uint16_t *mask = h->tick_static_mask;
+    const uint8_t  *slot = h->tick_slot;
+    const int8_t   *bidx = h->tick_bit_idx;
+    const uint8_t ndl = h->i2s->num_data_lines;
+    const uint8_t ns  = h->i2s->num_slots;
+    const uint8_t dsb = h->i2s->data_start_bit;
+
+    for (uint16_t t = 0; t < tpf; t++) {
+        uint8_t w = (uint8_t)mask[t];
+        int8_t bi = bidx[t];
+        if (bi >= 0 && samp) {
+            uint32_t sh = 31 - (uint32_t)bi;
+            uint8_t sl = slot[t];
+            for (uint8_t ln = 0; ln < ndl; ln++)
+                w |= (uint8_t)(((uint32_t)samp[ln * ns + sl] >> sh) & 1) << (dsb + ln);
+        }
+        dst[t] = w;
+    }
+}
+
+/*
+ * Generic encoder for multi-protocol (I2S + SPDIF + ADAT combinations).
+ */
+static void IRAM_ATTR encode_frame_generic(struct parlio_audio_tx *h,
+                                            uint8_t *dst,
+                                            const int32_t *samples)
 {
     const uint16_t tpf = h->ticks_per_frame;
     const uint8_t  pw  = h->parlio_width;
 
-    /* Pre-encode serial protocols into temporary bit buffers */
     uint8_t spdif_bits[16];
     uint8_t adat_bits[32];
 
     if (h->spdif) {
         const int32_t *sp = samples ? (samples + h->spdif_offset) : NULL;
-        encode_spdif_raw(h->spdif, spdif_bits,
-                         sp ? sp[0] : 0, sp ? sp[1] : 0);
+        encode_spdif_raw(h->spdif, spdif_bits, sp ? sp[0] : 0, sp ? sp[1] : 0);
     }
     if (h->adat) {
         const int32_t *ap = samples ? (samples + h->adat_offset) : NULL;
         encode_adat_raw(h->adat, adat_bits, ap);
     }
 
-    /* I2S sample pointer and state */
     const int32_t *i2s_samp = (h->i2s && samples) ? samples + h->i2s_offset : NULL;
     const uint16_t *static_mask = h->tick_static_mask;
-    const uint8_t  *slot_lut    = h->tick_slot;
-    const int8_t   *bidx_lut    = h->tick_bit_idx;
-
-    /* I2S state cache */
+    const uint8_t  *slot_lut = h->tick_slot;
+    const int8_t   *bidx_lut = h->tick_bit_idx;
     uint8_t i2s_ndl = 0, i2s_ns = 0, i2s_dsb = 0;
     if (h->i2s) {
         i2s_ndl = h->i2s->num_data_lines;
         i2s_ns  = h->i2s->num_slots;
         i2s_dsb = h->i2s->data_start_bit;
     }
-
-    /* Cache protocol bit positions */
     const uint8_t spdif_dbit = h->spdif ? h->spdif->data_bit : 0;
     const uint8_t adat_dbit  = h->adat  ? h->adat->data_bit  : 0;
     const uint16_t *spdif_ui_lut = h->tick_spdif_ui;
@@ -337,44 +364,42 @@ static void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
     const bool has_spdif = (h->spdif != NULL);
     const bool has_adat  = (h->adat  != NULL);
 
-    /* Compose each PARLIO tick using lookup tables (zero divisions) */
     for (uint16_t tick = 0; tick < tpf; tick++) {
         uint16_t word = static_mask[tick];
 
-        /* I2S data bits */
         int8_t bi = bidx_lut[tick];
         if (bi >= 0 && i2s_samp) {
             uint8_t sl = slot_lut[tick];
             uint32_t shift = 31 - (uint32_t)bi;
-            for (uint8_t line = 0; line < i2s_ndl; line++) {
+            for (uint8_t line = 0; line < i2s_ndl; line++)
                 word |= (uint16_t)((i2s_samp[line * i2s_ns + sl] >> shift) & 1) << (i2s_dsb + line);
-            }
         }
-
-        /* S/PDIF: index from pre-computed table */
         if (has_spdif) {
             uint16_t ui = spdif_ui_lut[tick];
             word |= (uint16_t)((spdif_bits[ui >> 3] >> (ui & 7)) & 1) << spdif_dbit;
         }
-
-        /* ADAT: index from pre-computed table */
         if (has_adat) {
             uint16_t ai = adat_bi_lut[tick];
             word |= (uint16_t)((adat_bits[ai >> 3] >> (ai & 7)) & 1) << adat_dbit;
         }
 
-        /* Pack word into DMA buffer according to data_width.
-         * For width < 8: multiple words pack per byte, LSB first. */
         if (pw == 8) {
             dst[tick] = (uint8_t)word;
-        } else if (pw == 16) {
-            ((uint16_t *)dst)[tick] = word;
         } else {
-            /* pw = 1, 2, or 4: pack into bytes */
-            size_t byte_pos = (tick * pw) / 8;
-            size_t bit_pos  = (tick * pw) % 8;
-            dst[byte_pos] |= (uint8_t)((word & ((1 << pw) - 1)) << bit_pos);
+            ((uint16_t *)dst)[tick] = word;
         }
+    }
+}
+
+/* Dispatch to the appropriate encoder */
+static inline void IRAM_ATTR encode_frame(struct parlio_audio_tx *h,
+                                           uint8_t *dst,
+                                           const int32_t *samples)
+{
+    if (h->i2s && !h->spdif && !h->adat) {
+        encode_frame_i2s_only(h, dst, samples);
+    } else {
+        encode_frame_generic(h, dst, samples);
     }
 }
 
