@@ -299,10 +299,11 @@ static void unified_audio_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void run_unified_test(const char *label, uint32_t sample_rate,
-                              const parlio_audio_i2s_config_t *i2s_cfg,
-                              const parlio_audio_adat_config_t *adat_cfg,
-                              uint16_t mclk_mult)
+static void run_unified_test_spdif(const char *label, uint32_t sample_rate,
+                                    const parlio_audio_i2s_config_t *i2s_cfg,
+                                    const parlio_audio_spdif_config_t *spdif_cfg,
+                                    const parlio_audio_adat_config_t *adat_cfg,
+                                    uint16_t mclk_mult)
 {
     /* Count total channels */
     int num_channels = 0;
@@ -312,6 +313,11 @@ static void run_unified_test(const char *label, uint32_t sample_rate,
         num_channels += i2s_cfg->num_data_lines * ns;
         uint32_t bclk_tpf = 32 * ns;
         if (bclk_tpf > ticks_per_frame) ticks_per_frame = bclk_tpf;
+    }
+    if (spdif_cfg) {
+        num_channels += 2;
+        uint32_t spdif_tpf = 128;
+        if (spdif_tpf > ticks_per_frame) ticks_per_frame = spdif_tpf;
     }
     if (adat_cfg) {
         num_channels += 8;
@@ -334,6 +340,7 @@ static void run_unified_test(const char *label, uint32_t sample_rate,
         .mclk_gpio = PIN_MCLK,
         .clk_out_gpio = PIN_BCLK, /* PCNT measures this pin */
         .i2s = i2s_cfg,
+        .spdif = spdif_cfg,
         .adat = adat_cfg,
         .dma_buffer_count = 4,
         .frames_per_buffer = FRAMES_PER_BUF,
@@ -485,7 +492,7 @@ void app_main(void)
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
     /* Count total tests */
-    test_total = 17 + 5 + 3 + 4 + 3 + 9; /* 48k + 96k + 192k + 44.1k + low + unified */
+    test_total = 17 + 5 + 3 + 4 + 3 + 9 + 5; /* 48k + 96k + 192k + 44.1k + low + adat + spdif */
 
     printf("\n" C_BOLD "========================================" C_RESET "\n");
     printf(C_BOLD "  PARLIO I2S Throughput Sweep" C_RESET "\n");
@@ -549,7 +556,7 @@ void app_main(void)
     {
         /* ADAT only (8 ch) */
         parlio_audio_adat_config_t adat_only = { .adat_gpio = PIN_DATA0 };
-        run_unified_test("ADAT only (8ch)", 48000, NULL, &adat_only, 512);
+        run_unified_test_spdif("ADAT only (8ch)", 48000, NULL, NULL, &adat_only, 512);
 
         /* ADAT + I2S stereo (10 ch) */
         parlio_audio_i2s_config_t i2s_1x2 = {
@@ -559,7 +566,7 @@ void app_main(void)
             .data_gpios = { PIN_DATA3 },
         };
         parlio_audio_adat_config_t adat_w_i2s = { .adat_gpio = PIN_DATA4 };
-        run_unified_test("ADAT+Stereo (10ch)", 48000, &i2s_1x2, &adat_w_i2s, 512);
+        run_unified_test_spdif("ADAT+Stereo (10ch)", 48000, &i2s_1x2, NULL, &adat_w_i2s, 512);
 
         /* ADAT + I2S TDM4 x2 (16 ch) */
         parlio_audio_i2s_config_t i2s_2x4 = {
@@ -569,7 +576,7 @@ void app_main(void)
             .data_gpios = { PIN_DATA3, PIN_DATA4 },
         };
         parlio_audio_adat_config_t adat_w_tdm4 = { .adat_gpio = PIN_DATA5 };
-        run_unified_test("ADAT+TDM4x2 (16ch)", 48000, &i2s_2x4, &adat_w_tdm4, 512);
+        run_unified_test_spdif("ADAT+TDM4x2 (16ch)", 48000, &i2s_2x4, NULL, &adat_w_tdm4, 512);
 
         /* ADAT + I2S TDM8 x1 (16 ch) */
         parlio_audio_i2s_config_t i2s_1x8 = {
@@ -579,7 +586,7 @@ void app_main(void)
             .data_gpios = { PIN_DATA3 },
         };
         parlio_audio_adat_config_t adat_w_tdm8 = { .adat_gpio = PIN_DATA4 };
-        run_unified_test("ADAT+TDM8x1 (16ch)", 48000, &i2s_1x8, &adat_w_tdm8, 512);
+        run_unified_test_spdif("ADAT+TDM8x1 (16ch)", 48000, &i2s_1x8, NULL, &adat_w_tdm8, 512);
 
         /* ADAT + I2S stereo x4 (16 ch) */
         parlio_audio_i2s_config_t i2s_4x2 = {
@@ -589,7 +596,7 @@ void app_main(void)
             .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6 },
         };
         parlio_audio_adat_config_t adat_w_4stereo = { .adat_gpio = PIN_DATA7 };
-        run_unified_test("ADAT+Stereo4 (16ch)", 48000, &i2s_4x2, &adat_w_4stereo, 512);
+        run_unified_test_spdif("ADAT+Stereo4 (16ch)", 48000, &i2s_4x2, NULL, &adat_w_4stereo, 512);
 
         /* ADAT + I2S TDM8 x4 (40 ch) */
         parlio_audio_i2s_config_t i2s_4x8 = {
@@ -599,7 +606,7 @@ void app_main(void)
             .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6 },
         };
         parlio_audio_adat_config_t adat_w_tdm8x4 = { .adat_gpio = PIN_DATA7 };
-        run_unified_test("ADAT+TDM8x4 (40ch)", 48000, &i2s_4x8, &adat_w_tdm8x4, 512);
+        run_unified_test_spdif("ADAT+TDM8x4 (40ch)", 48000, &i2s_4x8, NULL, &adat_w_tdm8x4, 512);
 
         /* ADAT + I2S TDM4 x7 (36 ch) */
         parlio_audio_i2s_config_t i2s_7x4 = {
@@ -610,7 +617,7 @@ void app_main(void)
                             PIN_DATA7, PIN_DATA8, PIN_DATA9 },
         };
         parlio_audio_adat_config_t adat_w_tdm4x7 = { .adat_gpio = PIN_DATA10 };
-        run_unified_test("ADAT+TDM4x7 (36ch)", 48000, &i2s_7x4, &adat_w_tdm4x7, 512);
+        run_unified_test_spdif("ADAT+TDM4x7 (36ch)", 48000, &i2s_7x4, NULL, &adat_w_tdm4x7, 512);
 
         /* ADAT + I2S Stereo x8 (24 ch) */
         parlio_audio_i2s_config_t i2s_8x2 = {
@@ -622,11 +629,64 @@ void app_main(void)
         };
         parlio_audio_adat_config_t adat_w_8stereo = { .adat_gpio = PIN_LRCK };
         /* Note: reuse LRCK pin for ADAT since unified driver assigns its own TXD */
-        run_unified_test("ADAT+Stereo8 (24ch)", 48000, &i2s_8x2, &adat_w_8stereo, 512);
+        run_unified_test_spdif("ADAT+Stereo8 (24ch)", 48000, &i2s_8x2, NULL, &adat_w_8stereo, 512);
 
         /* ADAT 44.1 kHz (8 ch) */
         parlio_audio_adat_config_t adat_441 = { .adat_gpio = PIN_DATA0 };
-        run_unified_test("ADAT 44.1k (8ch)", 44100, NULL, &adat_441, 512);
+        run_unified_test_spdif("ADAT 44.1k (8ch)", 44100, NULL, NULL, &adat_441, 512);
+    }
+
+    /* ---- S/PDIF tests (via unified driver) ---- */
+    printf("\n" C_BOLD "  --- S/PDIF (unified driver) ---" C_RESET "\n");
+    {
+        /* S/PDIF only (2 ch) -- PARLIO clock = 128*Fs */
+        parlio_audio_spdif_config_t spdif_only = {
+            .bits_per_sample = 24, .consumer_format = true,
+            .spdif_gpio = PIN_DATA0,
+        };
+        run_unified_test_spdif("SPDIF only (2ch)", 48000, NULL, &spdif_only, NULL, 256);
+
+        /* S/PDIF + I2S stereo (4 ch) */
+        parlio_audio_i2s_config_t i2s_spdif_stereo = {
+            .mode = PARLIO_AUDIO_I2S_STANDARD,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 1,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3 },
+        };
+        parlio_audio_spdif_config_t spdif_w_i2s = {
+            .bits_per_sample = 24, .consumer_format = true,
+            .spdif_gpio = PIN_DATA4,
+        };
+        run_unified_test_spdif("SPDIF+Stereo (4ch)", 48000, &i2s_spdif_stereo, &spdif_w_i2s, NULL, 256);
+
+        /* S/PDIF + ADAT (10 ch) */
+        parlio_audio_spdif_config_t spdif_w_adat_s = {
+            .bits_per_sample = 24, .consumer_format = true,
+            .spdif_gpio = PIN_DATA0,
+        };
+        parlio_audio_adat_config_t adat_w_spdif = { .adat_gpio = PIN_DATA1 };
+        run_unified_test_spdif("SPDIF+ADAT (10ch)", 48000, NULL, &spdif_w_adat_s, &adat_w_spdif, 512);
+
+        /* S/PDIF + ADAT + I2S stereo x2 (14 ch) -- all three protocols */
+        parlio_audio_i2s_config_t i2s_all3 = {
+            .mode = PARLIO_AUDIO_I2S_STANDARD,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 2,
+            .bclk_gpio = PIN_DATA2, .lrck_gpio = PIN_DATA3,
+            .data_gpios = { PIN_DATA4, PIN_DATA5 },
+        };
+        parlio_audio_spdif_config_t spdif_all3 = {
+            .bits_per_sample = 24, .consumer_format = true,
+            .spdif_gpio = PIN_DATA6,
+        };
+        parlio_audio_adat_config_t adat_all3 = { .adat_gpio = PIN_DATA7 };
+        run_unified_test_spdif("ALL3: I2S4+SPDIF+ADAT (14)", 48000, &i2s_all3, &spdif_all3, &adat_all3, 512);
+
+        /* S/PDIF 44.1 kHz (2 ch) */
+        parlio_audio_spdif_config_t spdif_441 = {
+            .bits_per_sample = 24, .consumer_format = true,
+            .spdif_gpio = PIN_DATA0,
+        };
+        run_unified_test_spdif("SPDIF 44.1k (2ch)", 44100, NULL, &spdif_441, NULL, 256);
     }
 
     /* ---- Summary ---- */
