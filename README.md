@@ -1,127 +1,192 @@
 # PARLIO Audio Transmitter for ESP32-P4
 
-Multi-protocol audio transmitter that abuses the Parallel IO peripheral on the ESP32-P4 to synthesize digital audio output signals, clocked by the APLL for sample-accurate timing. All outputs can run simultaneously from a single PARLIO TX unit, sample-locked with zero inter-protocol skew.
+Multi-protocol audio transmitter that creatively repurposes the Parallel IO peripheral on the ESP32-P4 to synthesize digital audio output signals, clocked by the APLL for sample-accurate timing.
 
-Supported protocols (any combination, all simultaneous):
-- **I2S / TDM** (via PARLIO) -- up to 240 channels (15 data lines x 16 TDM slots)
-- **S/PDIF** -- stereo IEC60958 with biphase mark coding, single wire
-- **ADAT Lightpipe** -- 8 channels of 24-bit audio with NRZI encoding, single wire
-- **I2S / TDM** (via I2S HW) -- the I2S peripheral used for clock generation can simultaneously output real audio on its own pins (up to 32 extra channels via TDM16 on I2S0)
+```
+                          ESP32-P4
+    +-----------------------------------------------------------+
+    |                                                           |
+    |   +-------+      +-------+      +---------+              |
+    |   | APLL  |----->|  I2S  |----->| MCLK    |-----> GPIO   |
+    |   | (PLL) |      | (clk  |      | output  |   |          |
+    |   +-------+      |  only)|      +---------+   |          |
+    |                   +-------+          |         |          |
+    |                                      | wire    |          |
+    |   +----------------------------------|---------+          |
+    |   |                                  v                    |
+    |   |  +---------+    +--------+   +---------+             |
+    |   |  | PARLIO  |<---| MCLK   |<--| ext clk |             |
+    |   |  |  TX     |    | divider|   | input   |             |
+    |   |  |         |    +--------+   +---------+             |
+    |   |  |         |         |                                |
+    |   |  |         |    +--------+                            |
+    |   |  |         |--->| clk_out|---------> BCLK             |
+    |   |  |         |    +--------+                            |
+    |   |  |         |                                          |
+    |   |  |  DMA    |    +--------+                            |
+    |   |  |  buf[]--|--->| TXD[0] |---------> LRCK / FSYNC    |
+    |   |  |         |    +--------+                            |
+    |   |  |         |    +--------+                            |
+    |   |  |         |--->| TXD[1] |---------> DATA 0           |
+    |   |  |         |    +--------+                            |
+    |   |  |         |    +--------+                            |
+    |   |  |         |--->| TXD[2] |---------> DATA 1           |
+    |   |  |         |    +--------+                            |
+    |   |  |         |       ...                                |
+    |   |  |         |    +--------+                            |
+    |   |  |         |--->|TXD[15] |---------> DATA 14          |
+    |   |  +---------+    +--------+                            |
+    |   |                                                       |
+    +-----------------------------------------------------------+
+```
 
-### Maximum channel counts
+## The Trick: Three Peripherals, One Clock
+
+We chain three peripherals together in ways they were never designed for:
+
+```
+  APLL (audio PLL)     I2S peripheral        GPIO matrix         PARLIO peripheral
+  +--------------+     +-------------+     +-------------+     +-----------------+
+  | Generates    |---->| Used ONLY   |---->| Same GPIO   |---->| Receives MCLK   |
+  | precise audio|     | for MCLK    |     | is both     |     | as ext clock    |
+  | clock        |     | generation  |     | output and  |     | input, divides  |
+  | (12.288 MHz) |     | (no audio!) |     | input       |     | to BCLK, shifts |
+  +--------------+     +-------------+     +-------------+     | out parallel    |
+                                                                | DMA data on     |
+                                                                | every BCLK tick |
+                                                                +-----------------+
+```
+
+**Peripheral 1 -- APLL**: Generates a precise audio master clock. Standard audio frequencies (12.288 MHz for 48 kHz, 11.2896 MHz for 44.1 kHz) are native to this PLL.
+
+**Peripheral 2 -- I2S**: Misused purely as a clock conduit. We allocate an I2S TX channel, configure it with `I2S_CLK_SRC_APLL`, but never write audio data to it. Its only job is to output MCLK on a GPIO pin. The I2S BCLK/WS/DOUT pins are left disconnected (or optionally used for real audio output as a "free" bonus).
+
+**Peripheral 3 -- PARLIO**: Designed for parallel display interfaces (LCD, LED matrices). We repurpose it as a multi-channel I2S transmitter. It reads the MCLK from the GPIO (via the GPIO matrix), divides it down to BCLK, and shifts out pre-computed bit patterns from DMA buffers on every BCLK cycle.
+
+### Why PARLIO and not just I2S?
+
+The ESP32-P4 has 3 I2S peripherals, each with at most 2 data output pins. PARLIO has **16 parallel data lines** that all shift simultaneously. By encoding LRCK on TXD[0] and audio data on TXD[1..15], we get up to **15 independent data outputs** from a single peripheral -- far more than I2S can provide.
+
+## How the DMA Buffer Encodes I2S Signals
+
+PARLIO shifts out one byte per BCLK tick across all TXD lines simultaneously:
+
+```
+  DMA buffer (one byte per BCLK cycle):
+
+  Byte layout:  [bit 0]  [bit 1]  [bit 2]  [bit 3]  ...  [bit 7]
+                  LRCK    DATA 0   DATA 1   DATA 2         unused
+
+  Example: stereo 32-bit, 1 data line (64 bytes per frame):
+
+  BCLK  0: LRCK=0, D=0      --> 0x00  (left slot, padding)
+  BCLK  1: LRCK=0, D=MSB(L) --> 0x00 or 0x02
+  BCLK  2: LRCK=0, D=bit30  --> 0x00 or 0x02
+    ...
+  BCLK 31: LRCK=0, D=bit1   --> 0x00 or 0x02
+  BCLK 32: LRCK=1, D=0      --> 0x01  (right slot, padding)
+  BCLK 33: LRCK=1, D=MSB(R) --> 0x01 or 0x03
+    ...
+  BCLK 63: LRCK=1, D=bit1   --> 0x01 or 0x03
+```
+
+### The LUT Encoder
+
+Instead of extracting one bit at a time (31 shift+mask+store per channel), we use a precomputed lookup table:
+
+```
+  For each data line at TXD position P, precompute:
+    line_lut[P][byte_value] = 8 output bytes as uint64_t
+
+  Input: one byte of sample (8 bits)
+  Output: 8 DMA bytes with each bit placed at position P
+
+  Example for line 0 (position 1), input byte 0xA5 = 10100101:
+    line_lut[0][0xA5] = { 0x02, 0x00, 0x02, 0x00, 0x00, 0x02, 0x00, 0x02 }
+
+  A 32-bit sample = 4 bytes = 4 LUT lookups = 4 uint64_t writes
+  Multiple data lines: OR the LUT results together
+```
+
+This makes the encoder ~4x faster than bit-by-bit extraction and enables real-time output at all TDM configurations up to TDM8 x 2 lines (16 channels) at 48 kHz.
+
+### Gapless DMA: Loop Transmission with Ping-Pong Buffers
+
+```
+  Buffer rotation (3 buffers):
+
+  Time -->
+  DMA:     [===buf0===][===buf1===][===buf2===][===buf0===]...
+  Encoder:        [fill1]   [fill2]   [fill0]   [fill1]...
+
+  buf0 plays (loop) while encoder fills buf1
+  Submit buf1 --> DMA chains seamlessly via gdma_link_concat
+  buf1 plays (loop) while encoder fills buf2
+  Submit buf2 --> seamless chain, buf0 now free
+  ...
+
+  Zero gap between buffers (DMA descriptor chaining in hardware)
+```
+
+The PARLIO driver's `loop_transmission` mode keeps the DMA running continuously. When a new buffer is submitted, the DMA hardware chains to it without stopping. The encoder paces submissions using `esp_timer_get_time()` with frame-count-based absolute timing to prevent drift.
+
+## Supported Protocols
+
+### I2S / TDM (via PARLIO)
+
+| Mode | Slots/Line | LRCK Behavior | Max Channels (15 lines) |
+|------|-----------|---------------|-------------------------|
+| Standard I2S | 2 | 50/50 duty cycle | **30** |
+| TDM4 | 4 | 1-BCLK frame sync | **60** |
+| TDM8 | 8 | 1-BCLK frame sync | **120** |
+| TDM16 | 16 | 1-BCLK frame sync | **240** |
+
+### S/PDIF (via PARLIO, 1-bit serial)
+
+Biphase mark coded stereo output at 128 * Fs on a single GPIO. Consumer or professional channel status.
+
+### ADAT Lightpipe (via PARLIO, 1-bit serial)
+
+NRZI encoded 8-channel 24-bit output at 256 * Fs on a single GPIO.
+
+### I2S HW Passthrough
+
+The I2S peripheral used for clock generation can also output real audio on its own pins. I2S0 has 2 data outputs (up to 32 TDM16 channels), I2S1/I2S2 have 1 each (16 channels).
+
+### Maximum Channel Counts
 
 | Scenario | Breakdown | Total |
 |----------|-----------|-------|
 | PARLIO TDM16 only | 15 lines x 16 slots | **240 ch** |
-| PARLIO TDM16 + I2S HW TDM16 (all 3 peripherals) | 240 + 32 + 16 + 16 | **304 ch** |
-| PARLIO I2S (12 lines) + SPDIF + ADAT + I2S0 TDM16 x2 | 24 + 2 + 8 + 32 | **66 ch** (mixed protocol) |
-| PARLIO ADAT + I2S0 TDM16 x2 + I2S1 TDM16 + I2S2 TDM16 | 8 + 32 + 16 + 16 | **72 ch** (with ADAT) |
+| PARLIO TDM16 + all I2S HW | 240 + 32 + 16 + 16 | **304 ch** |
+| Mixed: PARLIO I2S + SPDIF + ADAT + I2S0 | 24 + 2 + 8 + 32 | **66 ch** |
 
-All outputs share the same APLL clock -- zero inter-channel and inter-protocol clock drift
-
-## How it works
-
-The ESP32-P4's PARLIO peripheral is a parallel data output engine with DMA support, designed for display interfaces. We repurpose it as a multi-channel I2S/TDM transmitter:
-
-1. **APLL** generates a precise audio master clock via the I2S peripheral
-2. The **I2S MCLK pin** outputs MCLK directly to the DAC and simultaneously feeds into **PARLIO as external clock input** (same GPIO, via GPIO matrix)
-3. **PARLIO** divides MCLK down to BCLK internally and outputs it on the **dedicated `clk_out` pin** -- this does not consume a data line
-4. PARLIO parallel data bus carries:
-   - **TXD[0]** = LRCK / frame sync
-   - **TXD[1..N]** = audio data lines (up to 15)
-
-Each BCLK tick, PARLIO shifts out one parallel word containing the LRCK state and all data line bits. The DMA buffer contains pre-computed bit patterns -- one word per BCLK cycle.
-
-### Why BCLK on clk_out matters
-
-By using the dedicated clock output pin for BCLK instead of a data line:
-- **15 data lines** available instead of 14 (one extra GPIO freed)
-- **DMA bandwidth reduced** by the MCLK/BCLK ratio (typically 4x less traffic)
-- Only one GPIO needed for MCLK (serves as both DAC output and PARLIO clock input)
-- No separate loopback wire needed
-
-## Supported Modes
-
-| Mode | Slots/Line | LRCK Behavior | Typical Use |
-|------|-----------|---------------|-------------|
-| `PARLIO_I2S_MODE_STANDARD` | 2 | 50/50 duty cycle (Philips I2S) | Stereo DACs, codecs |
-| `PARLIO_I2S_MODE_TDM4` | 4 | 1-BCLK frame sync pulse | 4-ch DACs, small arrays |
-| `PARLIO_I2S_MODE_TDM8` | 8 | 1-BCLK frame sync pulse | Multi-ch audio interfaces |
-| `PARLIO_I2S_MODE_TDM16` | 16 | 1-BCLK frame sync pulse | High-density systems |
-
-## Channel Counts
-
-Each PARLIO data line carries `num_slots` audio channels. With up to 15 data lines:
-
-| Mode | Channels/Line | Max Lines | Max Channels |
-|------|--------------|-----------|-------------|
-| Standard I2S | 2 | 15 | **30** |
-| TDM4 | 4 | 15 | **60** |
-| TDM8 | 8 | 15 | **120** |
-| TDM16 | 16 | 15 | **240** |
-
-## Slot Width and BCLK Rate
-
-The `slot_width` parameter controls how many BCLK cycles each slot occupies. The total BCLK cycles per frame is `slot_width * num_slots`. Audio data is MSB-first within each slot, with unused bit positions zero-padded.
-
-Some codecs expect more BCLK cycles per frame than the audio data strictly requires. For example, a stereo 24-bit codec running at 256fs BCLK would use `slot_width = 128` (128 bits/slot x 2 slots = 256 BCLK/frame). Set `slot_width` to match whatever your codec expects:
-
-| Codec Expects | bits_per_sample | slot_width | BCLK/frame (stereo) |
-|--------------|----------------|-----------|---------------------|
-| 32fs | 16 | 16 | 32 |
-| 48fs | 24 | 24 | 48 |
-| 64fs (typical) | 16/24/32 | 32 | 64 |
-| 128fs | 16/24/32 | 64 | 128 |
-| 256fs | 16/24/32 | 128 | 256 |
-
-### MCLK Requirements
-
-The MCLK multiple (`mclk_multiple`) must satisfy:
-- `mclk_multiple >= slot_width * num_slots` (MCLK/BCLK ratio must be at least 1)
-- `mclk_multiple % (slot_width * num_slots) == 0` (must divide evenly)
-
-| Mode | slot_width=32 | Min `mclk_multiple` | MCLK @ 48 kHz |
-|------|--------------|---------------------|---------------|
-| Standard | 64 BCLK/frame | 64 | 3.072 MHz |
-| TDM4 | 128 BCLK/frame | 128 | 6.144 MHz |
-| TDM8 | 256 BCLK/frame | 256 | 12.288 MHz |
-| TDM16 | 512 BCLK/frame | 512 | 24.576 MHz |
-
-Typical MCLK multiples: 256x (standard/TDM4), 512x (TDM8), 1024x (TDM16).
-
-## Specifications
-
-- Sample rates: any rate achievable by APLL (8 kHz to 192 kHz)
-- Bit depths: 16, 24, or 32 bit
-- Slot width: configurable (>= bits_per_sample), controls BCLK rate
-- Data lines: 1 to 15 parallel outputs
-- Modes: Standard I2S (2-slot), TDM4, TDM8, TDM16
-- Total channels: up to 240 (15 lines x 16 TDM slots)
-- Format: I2S Philips (standard) or TDM with 1-BCLK frame sync
-- All channels share MCLK/BCLK/LRCK -- zero inter-channel clock drift
+All outputs share the same APLL clock -- zero inter-channel and inter-protocol clock drift.
 
 ## Performance
 
-Verified on ESP32-P4 at 360 MHz, 48 kHz, 32-bit, 128 frames/buffer:
+Hardware-verified on ESP32-P4 at 360 MHz using PCNT (pulse counter) to measure actual BCLK edges on the output pin:
 
-| Configuration | Channels | Measured Rate | Status |
-|---------------|----------|---------------|--------|
-| I2S Stereo x1 | 2 | 48000 Hz | PASS |
-| I2S Stereo x2 | 4 | 48000 Hz | PASS |
-| TDM4 x1 | 4 | 48000 Hz | PASS |
-| TDM8 x1 | 8 | 48000 Hz | PASS |
-| TDM4 x2 | 8 | 48000 Hz | PASS |
-| TDM8 x2 | 16 | 48000 Hz | PASS |
+| Configuration | Channels | BCLK Rate | Measured Fs | Status |
+|---------------|----------|-----------|-------------|--------|
+| I2S Stereo x1 | 2 | 3.072 MHz | 48000 Hz | PASS |
+| I2S Stereo x2 | 4 | 3.072 MHz | 48000 Hz | PASS |
+| TDM4 x1 | 4 | 6.144 MHz | 48000 Hz | PASS |
+| TDM8 x1 | 8 | 12.288 MHz | 48000 Hz | PASS |
+| TDM4 x2 | 8 | 6.144 MHz | 48000 Hz | PASS |
+| TDM8 x2 | 16 | 12.288 MHz | 48000 Hz | PASS |
 
-Key techniques for sustained real-time throughput:
-- **LUT encoder**: precomputed lookup table converts each byte of a sample into 8 output bytes in one uint64_t operation. Per-line LUTs OR'd together for multi-line configs.
-- **Loop DMA**: `parlio_tx_unit_transmit(loop_transmission=true)` uses DMA descriptor chaining (`gdma_link_concat`) for zero-gap buffer transitions.
-- **Absolute timing**: submissions paced by `esp_timer_get_time()` with frame-count-based absolute targets (no truncation drift).
-- **Dedicated CPU1 task**: encoding runs at highest priority on CPU1, no competition with system tasks.
+### Key Techniques
+
+- **LUT encoder**: per-line lookup table, 4 uint64_t writes per sample per line
+- **Loop DMA**: `parlio_tx_unit_transmit(loop_transmission=true)` + `gdma_link_concat` = zero-gap buffer chaining
+- **Absolute frame-count timing**: `total_submitted * 1000000 / sample_rate` prevents truncation drift
+- **Dedicated CPU1 task**: encoder at highest priority, no system task competition
+- **PCNT verification**: hardware pulse counter on BCLK pin confirms exact output frequency
 
 ## Latency
 
-Output latency = `frames_per_buffer * 3 / sample_rate` (3 rotating DMA buffers in loop mode).
+Output latency = `frames_per_buffer * 3 / sample_rate` (3 rotating DMA buffers).
 
 | frames_per_buffer | Latency @ 48 kHz |
 |-------------------|-------------------|
@@ -129,175 +194,28 @@ Output latency = `frames_per_buffer * 3 / sample_rate` (3 rotating DMA buffers i
 | 64 | 4 ms |
 | 32 | 2 ms |
 
-The generalized LUT encoder is fast enough for all configurations at 128 frames/buffer. Smaller buffers may work for simpler configs (stereo, TDM4).
+All signals (BCLK, LRCK, data lines) are in the same PARLIO clock domain, phase-aligned to within a single MCLK period (< 100 ns).
 
-There is no additional latency from clock synchronization -- BCLK, LRCK, and all data lines are output from the same PARLIO clock domain in the same DMA cycle, so all signals are phase-aligned to within a single MCLK period (< 100 ns at typical audio rates).
+## Slot Width and BCLK Rate
 
-## GPIO Wiring
+The `slot_width` parameter controls BCLK cycles per slot. Some codecs expect more BCLK than the sample width:
 
-| Signal | Default GPIO | PARLIO Function | Description |
-|--------|-------------|-----------------|-------------|
-| MCLK | 10 | ext clk input | I2S MCLK output + PARLIO clock source |
-| BCLK | 11 | clk_out (dedicated) | Bit clock, does not use a data line |
-| LRCK | 12 | TXD[0] | Word select (I2S) or frame sync (TDM) |
-| DATA0 | 13 | TXD[1] | Data line 0 |
-| DATA1 | 14 | TXD[2] | Data line 1 |
+| Codec Expects | bits_per_sample | slot_width | BCLK/frame (stereo) |
+|--------------|----------------|-----------|---------------------|
+| 64fs (typical) | 16/24/32 | 32 | 64 |
+| 128fs | 16/24/32 | 64 | 128 |
+| 256fs | 16/24/32 | 128 | 256 |
 
-The MCLK GPIO serves double duty: it outputs MCLK from the I2S/APLL (usable by DACs that need MCLK) and simultaneously feeds the PARLIO peripheral as external clock input via the GPIO matrix. No external loopback wire is needed.
+### MCLK Requirements
 
-## Use Cases
+`mclk_multiple` must be >= `slot_width * num_slots` and divide evenly.
 
-### Multi-DAC Audio Systems
-Drive multiple I2S DAC chips from a single peripheral. With 15 data lines, you can feed up to 15 stereo DACs simultaneously with perfectly synchronized clocks -- useful for immersive audio installations, Ambisonics rigs, or line array speaker processors.
-
-### High Channel Count Outputs
-Build a 240-channel audio output stage using TDM16 with 15 data lines. All channels share the same MCLK/BCLK/FSYNC, eliminating inter-channel clock drift that plagues multi-peripheral I2S setups.
-
-### Overcoming I2S Peripheral Limitations
-The ESP32-P4 has 3 I2S peripherals. If your design needs more than 3 independent I2S outputs, or needs more than the native TDM slot count, PARLIO gives you additional outputs without consuming I2S hardware (only one I2S channel is used as a clock source).
-
-### Custom Digital Audio Protocols
-Since LRCK and data are software-defined in the DMA buffer and slot_width is freely configurable, you can implement non-standard framing: asymmetric slot widths, custom LRCK patterns, DSP/PCM short/long frame sync, or TDM with arbitrary slot counts per data line.
-
-### Deterministic Multi-Channel Test Signal Generation
-Generate precisely timed test signals across many channels simultaneously -- useful for production-line testing of audio hardware, speaker arrays, or codec verification.
-
-### ADAT/SPDIF Bitstream Generation
-With software-defined output and configurable bit rates, you could synthesize ADAT lightpipe or SPDIF bitstreams directly, without dedicated transmitter ICs.
-
-## S/PDIF Transmitter
-
-Single-wire S/PDIF output using biphase mark coding (BMC). Uses PARLIO in 1-bit serial mode at 128 * Fs.
-
-- Stereo, 16/20/24 bit
-- Consumer or professional channel status
-- 192-frame channel status block transmitted cyclically
-- One GPIO pin for the S/PDIF output (directly drives coax or optical transmitter)
-
-```c
-parlio_spdif_tx_config_t cfg = {
-    .sample_rate = 48000,
-    .bits_per_sample = 24,
-    .mclk_multiple = 256,
-    .mclk_gpio = GPIO_NUM_20,
-    .spdif_gpio = GPIO_NUM_22,
-    .consumer_format = true,
-};
-parlio_spdif_tx_handle_t spdif;
-parlio_spdif_tx_new(&cfg, &spdif);
-parlio_spdif_tx_enable(spdif);
-
-int32_t stereo[2] = { left_sample, right_sample };
-parlio_spdif_tx_write(spdif, stereo, 1, NULL, 1000);
-```
-
-## ADAT Lightpipe Transmitter
-
-8-channel ADAT output using NRZI encoding. Uses PARLIO in 1-bit serial mode at 256 * Fs.
-
-- 8 channels, 24-bit, 48 kHz (standard ADAT)
-- One GPIO pin for the ADAT output (drives TOTX173/177 optical transmitter or coax)
-- Frame includes sync pattern, nibble separators, and per-channel user bits
-
-```c
-parlio_adat_tx_config_t cfg = {
-    .sample_rate = 48000,
-    .mclk_multiple = 512,
-    .mclk_gpio = GPIO_NUM_20,
-    .adat_gpio = GPIO_NUM_22,
-};
-parlio_adat_tx_handle_t adat;
-parlio_adat_tx_new(&cfg, &adat);
-parlio_adat_tx_enable(adat);
-
-int32_t frame[8] = { ch0, ch1, ch2, ch3, ch4, ch5, ch6, ch7 };
-parlio_adat_tx_write(adat, frame, 1, NULL, 1000);
-```
-
-## Unified Multi-Protocol Output
-
-The unified driver (`parlio_audio_tx.h`) can output I2S, S/PDIF, and ADAT simultaneously on a single PARLIO TX unit. All protocols are encoded as parallel bit patterns in the same DMA buffer and shift out in lockstep.
-
-The PARLIO clock runs at the fastest protocol's rate (256 * Fs when ADAT is active). Slower protocols repeat their symbols to match. All outputs are sample-locked with zero inter-protocol skew.
-
-```c
-parlio_audio_i2s_config_t i2s_cfg = {
-    .mode = PARLIO_AUDIO_I2S_STANDARD,
-    .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 4,
-    .bclk_gpio = GPIO_NUM_22, .lrck_gpio = GPIO_NUM_23,
-    .data_gpios = { GPIO_NUM_24, GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27 },
-};
-parlio_audio_spdif_config_t spdif_cfg = {
-    .bits_per_sample = 24, .consumer_format = true,
-    .spdif_gpio = GPIO_NUM_28,
-};
-parlio_audio_adat_config_t adat_cfg = {
-    .adat_gpio = GPIO_NUM_29,
-};
-
-parlio_audio_tx_config_t cfg = {
-    .sample_rate = 48000,
-    .mclk_gpio = GPIO_NUM_20,
-    .clk_out_gpio = GPIO_NUM_21,    /* outputs PARLIO clock as MCLK */
-    .i2s = &i2s_cfg,                /* 4 lines x 2 = 8 I2S channels */
-    .spdif = &spdif_cfg,            /* 2 S/PDIF channels */
-    .adat = &adat_cfg,              /* 8 ADAT channels */
-};
-
-parlio_audio_tx_handle_t tx;
-parlio_audio_tx_new(&cfg, &tx);
-parlio_audio_tx_enable(tx);
-
-/* Write all 18 channels per frame: [8x I2S, 2x SPDIF, 8x ADAT] */
-size_t frame_size = parlio_audio_tx_get_frame_size(tx); /* = 18 */
-int32_t samples[18] = { ... };
-parlio_audio_tx_write(tx, samples, 1, NULL, 1000);
-```
-
-### I2S HW Passthrough
-
-The I2S peripheral used for APLL clock generation is normally idle (only MCLK output). With the `i2s_hw` config, it also outputs real audio on its own BCLK/WS/DOUT pins -- zero additional peripheral cost. Write to it via the standard ESP-IDF `i2s_channel_write()` API.
-
-```c
-parlio_audio_i2s_hw_config_t hw_cfg = {
-    .bits_per_sample = 32,
-    .total_slots = 8,                   /* TDM8 on the I2S HW peripheral */
-    .bclk_gpio = GPIO_NUM_30,
-    .ws_gpio   = GPIO_NUM_31,
-    .dout_gpio = GPIO_NUM_32,
-    .dout2_gpio = -1,                   /* second DOUT available on I2S0 only */
-};
-
-parlio_audio_tx_config_t cfg = {
-    .sample_rate = 48000,
-    .mclk_gpio = GPIO_NUM_20,
-    .adat = &adat_cfg,                  /* 8 ch ADAT via PARLIO */
-    .i2s_hw = &hw_cfg,                  /* 8 ch TDM via I2S HW */
-};
-
-parlio_audio_tx_handle_t tx;
-parlio_audio_tx_new(&cfg, &tx);
-parlio_audio_tx_enable(tx);
-
-/* Write ADAT via PARLIO path */
-parlio_audio_tx_write(tx, adat_samples, num_frames, NULL, 1000);
-
-/* Write I2S HW via standard ESP-IDF API (sample-locked, same APLL) */
-i2s_chan_handle_t i2s_hw = parlio_audio_tx_get_i2s_hw_handle(tx);
-i2s_channel_write(i2s_hw, tdm_samples, size, &bytes_written, 1000);
-```
-
-### Resource usage per combination
-
-| Configuration | PARLIO clock | Data width | DMA/frame | PARLIO ch | I2S HW ch | Total |
-|---------------|-------------|------------|-----------|-----------|-----------|-------|
-| I2S only (4 lines) | 64*Fs | 8-bit | 64 B | 8 | -- | 8 |
-| ADAT only | 256*Fs | 1-bit | 32 B | 8 | -- | 8 |
-| ADAT + I2S HW TDM8 | 256*Fs | 1-bit | 32 B | 8 | 8 | 16 |
-| I2S (4) + SPDIF + ADAT | 256*Fs | 8-bit | 256 B | 18 | -- | 18 |
-| I2S (4) + SPDIF + ADAT + I2S HW TDM16 | 256*Fs | 8-bit | 256 B | 18 | 16 | 34 |
-| I2S (12) + SPDIF + ADAT + I2S HW TDM16x2 | 256*Fs | 16-bit | 512 B | 34 | 32 | 66 |
-| Max (all I2S peripherals) | 256*Fs | 16-bit | 512 B | 34 | 64 | 98 |
+| Mode | slot_width=32 | Min `mclk_multiple` | MCLK @ 48 kHz |
+|------|--------------|---------------------|---------------|
+| Standard | 64 BCLK/frame | 128 | 6.144 MHz |
+| TDM4 | 128 BCLK/frame | 256 | 12.288 MHz |
+| TDM8 | 256 BCLK/frame | 512 | 24.576 MHz |
+| TDM16 | 512 BCLK/frame | 1024 | 49.152 MHz |
 
 ## Build
 
@@ -307,50 +225,21 @@ idf.py build
 idf.py flash monitor
 ```
 
-## Demo Application
-
-The included `main.c` demonstrates the unified driver outputting three protocols simultaneously:
-
-| Output | Protocol | Channels | Content |
-|--------|----------|----------|---------|
-| PARLIO TXD[0-2] | I2S Philips | 2 (stereo) | 440 Hz / 880 Hz sine |
-| PARLIO TXD[3] | ADAT | 8 | 200-900 Hz across channels |
-| I2S HW (GPIO 27-29) | I2S Philips | 2 (stereo) | 1000 Hz / 1500 Hz sine |
-| **Total** | | **12 channels** | All sample-locked |
-
-Requires a physical wire between GPIO 20 and GPIO 21 (MCLK loopback). Runs a 30-second timed test reporting effective sample rate, then loops continuously for scope inspection.
-
-GPIO assignments in the demo:
-- GPIO 20: MCLK out (wire source)
-- GPIO 21: PARLIO ext clk in (wire destination)
-- GPIO 22: PARLIO clk_out (256*Fs, usable as MCLK)
-- GPIO 23: I2S BCLK (PARLIO TXD[0], synthesized)
-- GPIO 24: I2S LRCK (PARLIO TXD[1])
-- GPIO 25: I2S DATA (PARLIO TXD[2])
-- GPIO 26: ADAT output (PARLIO TXD[3])
-- GPIO 27-29: I2S HW BCLK/WS/DOUT
+Requires ESP-IDF v5.4+ with ESP32-P4 support.
 
 ## Component API
 
-### Standalone drivers (single protocol, simple)
+### Standalone drivers
 
-- `parlio_i2s.h` -- I2S/TDM transmitter (BCLK on clk_out, efficient)
-- `parlio_spdif_tx.h` -- S/PDIF transmitter (1-bit serial, BMC)
-- `parlio_adat_tx.h` -- ADAT transmitter (1-bit serial, NRZI)
+- `parlio_i2s.h` -- I2S/TDM (BCLK on clk_out, LUT encoder, loop DMA)
+- `parlio_spdif_tx.h` -- S/PDIF (1-bit BMC serial)
+- `parlio_adat_tx.h` -- ADAT (1-bit NRZI serial)
 
-### Unified driver (multi-protocol, flexible)
+### Unified multi-protocol driver
 
 - `parlio_audio_tx.h` -- any combination of I2S + S/PDIF + ADAT + I2S HW passthrough
 
-Key functions:
-- `parlio_audio_tx_new()` -- configure protocols, auto-select clock rates
-- `parlio_audio_tx_enable()` -- start all outputs with silence pre-fill
-- `parlio_audio_tx_write()` -- write interleaved samples for all PARLIO protocols
-- `parlio_audio_tx_get_i2s_hw_handle()` -- get I2S channel for HW passthrough writes
-- `parlio_audio_tx_get_frame_size()` -- query samples per frame
-- `parlio_audio_tx_delete()` -- clean up
-
-### Quick Example (TDM8, 2 lines = 16 channels, standalone)
+### Quick Example
 
 ```c
 parlio_i2s_tx_config_t cfg = {
@@ -360,18 +249,18 @@ parlio_i2s_tx_config_t cfg = {
     .num_data_lines = 2,
     .mclk_multiple  = 512,
     .mode           = PARLIO_I2S_MODE_TDM8,
-    .mclk_gpio      = GPIO_NUM_10,
-    .bclk_gpio      = GPIO_NUM_11,
-    .lrck_gpio      = GPIO_NUM_12,
-    .data_gpios     = { GPIO_NUM_13, GPIO_NUM_14 },
-    .dma_buffer_count  = 4,
-    .frames_per_buffer = 64,
+    .mclk_gpio      = GPIO_NUM_21,
+    .bclk_gpio      = GPIO_NUM_22,
+    .lrck_gpio      = GPIO_NUM_23,
+    .data_gpios     = { GPIO_NUM_24, GPIO_NUM_25 },
+    .frames_per_buffer = 128,
 };
 
 parlio_i2s_tx_handle_t tx;
 parlio_i2s_tx_new(&cfg, &tx);
 parlio_i2s_tx_enable(tx);
 
+/* 16 channels: [line0_slot0..slot7, line1_slot0..slot7] */
 int32_t samples[16];
 size_t written;
 parlio_i2s_tx_write(tx, samples, 1, &written, 1000);
