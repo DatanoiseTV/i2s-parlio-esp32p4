@@ -6,6 +6,8 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/parlio_tx.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
@@ -13,6 +15,32 @@
 #include "freertos/semphr.h"
 
 static const char *TAG = "parlio_audio";
+
+/* ------------------------------------------------------------------ */
+/*  Per-line LUT (shared with standalone driver)                       */
+/* ------------------------------------------------------------------ */
+
+#define MAX_LUT_LINES 15
+static DRAM_ATTR uint64_t s_line_lut[MAX_LUT_LINES][256];
+static DRAM_ATTR uint64_t s_lrck_mask_64; /* 0x0101010101010101 */
+static int s_lut_lines = 0;
+
+static void ensure_line_luts(int num_lines)
+{
+    if (num_lines <= s_lut_lines) return;
+    if (num_lines > MAX_LUT_LINES) num_lines = MAX_LUT_LINES;
+    for (int line = s_lut_lines; line < num_lines; line++) {
+        int bit_pos = 1 + line; /* TXD position for this data line */
+        for (int v = 0; v < 256; v++) {
+            uint8_t out[8];
+            for (int b = 0; b < 8; b++)
+                out[b] = ((v >> (7 - b)) & 1) << bit_pos;
+            memcpy(&s_line_lut[line][v], out, 8);
+        }
+    }
+    s_lrck_mask_64 = 0x0101010101010101ULL;
+    s_lut_lines = num_lines;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Internal sub-structures for each protocol                          */
@@ -97,9 +125,12 @@ struct parlio_audio_tx {
     size_t   write_frame_pos;
 
     SemaphoreHandle_t write_sem;
-    i2s_chan_handle_t       i2s_clk_chan;  /* also used for HW audio output if i2s_hw configured */
-    bool                    i2s_hw_enabled; /* true if i2s_clk_chan also outputs audio */
+    i2s_chan_handle_t       i2s_clk_chan;
+    bool                    i2s_hw_enabled;
     parlio_tx_unit_handle_t parlio_unit;
+    int64_t  start_time_us;
+    uint64_t total_submitted;
+    bool loop_mode;
     bool enabled;
 };
 
@@ -295,33 +326,93 @@ static void build_tick_tables(struct parlio_audio_tx *h)
 /* ------------------------------------------------------------------ */
 
 /*
- * Fast path: I2S-only encoder (no SPDIF/ADAT). Avoids all serial protocol
- * overhead, protocol NULL checks, and struct indirection. Just table lookups
- * and byte writes.
+ * Fast path: I2S-only encoder using LUT (same as standalone parlio_i2s).
+ * Uses per-line LUT for 8-byte-at-a-time bit extraction. The LUT indices
+ * are offset by data_start_bit since the unified driver may place data
+ * lines at different TXD positions than the standalone driver.
  */
 static void IRAM_ATTR encode_frame_i2s_only(struct parlio_audio_tx *h,
                                               uint8_t *dst,
                                               const int32_t *samples)
 {
-    const uint16_t tpf = h->ticks_per_frame;
     const int32_t *samp = samples ? samples + h->i2s_offset : NULL;
-    const uint16_t *mask = h->tick_static_mask;
-    const uint8_t  *slot = h->tick_slot;
-    const int8_t   *bidx = h->tick_bit_idx;
-    const uint8_t ndl = h->i2s->num_data_lines;
-    const uint8_t ns  = h->i2s->num_slots;
-    const uint8_t dsb = h->i2s->data_start_bit;
+    const i2s_state_t *is = h->i2s;
+    const uint8_t sw  = is->slot_width;
+    const uint8_t bps = is->bits_per_sample;
+    const uint8_t ndl = is->num_data_lines;
+    const uint8_t ns  = is->num_slots;
+    const uint8_t dsb = is->data_start_bit;
+    const bool    is_std = (is->mode == PARLIO_AUDIO_I2S_STANDARD);
 
-    for (uint16_t t = 0; t < tpf; t++) {
-        uint8_t w = (uint8_t)mask[t];
-        int8_t bi = bidx[t];
-        if (bi >= 0 && samp) {
-            uint32_t sh = 31 - (uint32_t)bi;
-            uint8_t sl = slot[t];
-            for (uint8_t ln = 0; ln < ndl; ln++)
-                w |= (uint8_t)(((uint32_t)samp[ln * ns + sl] >> sh) & 1) << (dsb + ln);
+    /* Build per-line LUTs indexed by TXD position (dsb + line) */
+    /* s_line_lut is indexed 0..MAX_LUT_LINES-1 for data_start_bit positions */
+
+    const uint8_t data_bits = (bps < sw) ? bps : (sw - 1);
+    const uint8_t full_groups = data_bits / 8;
+    const uint8_t remainder = data_bits % 8;
+
+    if (!samp) {
+        /* Silence: just LRCK pattern */
+        memset(dst, 0, h->ticks_per_frame);
+        if (is_std) {
+            for (uint16_t p = sw; p < h->ticks_per_frame; p++)
+                dst[p] = (1 << is->lrck_bit);
+        } else {
+            dst[0] = (1 << is->lrck_bit);
         }
-        dst[t] = w;
+        return;
+    }
+
+    for (uint8_t slot = 0; slot < ns; slot++) {
+        uint16_t base = slot * sw;
+        uint8_t lrck_byte = 0;
+        if (is_std) {
+            lrck_byte = (slot >= 1) ? (1 << is->lrck_bit) : 0;
+        } else {
+            lrck_byte = (slot == 0) ? (1 << is->lrck_bit) : 0;
+        }
+
+        dst[base] = lrck_byte;
+
+        uint8_t *out = dst + base + 1;
+        for (uint8_t g = 0; g < full_groups; g++) {
+            uint64_t combined = 0;
+            for (uint8_t line = 0; line < ndl; line++) {
+                const uint8_t *sbytes = (const uint8_t *)&samp[line * ns + slot];
+                combined |= s_line_lut[dsb - 1 + line][sbytes[3 - g]];
+            }
+            if (lrck_byte) {
+                uint64_t lm = 0;
+                memset(&lm, lrck_byte, 8); /* broadcast lrck_byte to all 8 bytes */
+                combined |= lm;
+            }
+            memcpy(out + g * 8, &combined, 8);
+        }
+
+        if (remainder > 0) {
+            uint64_t combined = 0;
+            for (uint8_t line = 0; line < ndl; line++) {
+                const uint8_t *sbytes = (const uint8_t *)&samp[line * ns + slot];
+                combined |= s_line_lut[dsb - 1 + line][sbytes[3 - full_groups]];
+            }
+            if (lrck_byte) {
+                uint64_t lm = 0;
+                memset(&lm, lrck_byte, 8);
+                combined |= lm;
+            }
+            uint8_t *src = (uint8_t *)&combined;
+            for (uint8_t r = 0; r < remainder; r++)
+                out[full_groups * 8 + r] = src[r];
+        }
+
+        uint16_t data_end = 1 + data_bits;
+        for (uint16_t p = data_end; p < sw; p++)
+            dst[base + p] = lrck_byte;
+
+        if (!is_std && slot == 0 && lrck_byte) {
+            for (uint16_t p = 1; p < sw; p++)
+                dst[base + p] &= ~(1 << is->lrck_bit);
+        }
     }
 }
 
@@ -597,9 +688,14 @@ esp_err_t parlio_audio_tx_new(const parlio_audio_tx_config_t *config,
     ESP_GOTO_ON_FALSE(h->tick_static_mask && h->tick_bit_idx,
                       ESP_ERR_NO_MEM, fail, TAG, "alloc tick tables");
 
-    /* --- DMA buffers --- */
+    /* Initialize per-line LUTs for I2S fast encoding */
+    if (h->i2s) {
+        ensure_line_luts(h->i2s->data_start_bit - 1 + h->i2s->num_data_lines);
+    }
+
+    /* --- DMA buffers (3 for loop mode rotation) --- */
     h->frames_per_buf = config->frames_per_buffer ? config->frames_per_buffer : 64;
-    h->dma_buf_count  = config->dma_buffer_count  ? config->dma_buffer_count  : 4;
+    h->dma_buf_count  = 3; /* always 3 for loop DMA ping-pong-pong */
 
     /* With data_width < 8, PARLIO packs multiple words per byte (LSB order).
      * data_width=1: 8 ticks/byte, =2: 4 ticks/byte, =4: 2 ticks/byte,
@@ -796,35 +892,40 @@ esp_err_t parlio_audio_tx_enable(parlio_audio_tx_handle_t handle)
     ESP_RETURN_ON_ERROR(parlio_tx_unit_enable(handle->parlio_unit), TAG, "enable failed");
 
     handle->enabled = true;
-    handle->write_buf_idx = 0;
-    handle->write_frame_pos = 0;
+    handle->loop_mode = true;
 
     /* Reset encoder states */
     if (handle->spdif) { handle->spdif->frame_in_block = 0; handle->spdif->bmc_state = 0; }
     if (handle->adat)  { handle->adat->nrzi_state = 0; }
 
-    /* Pre-fill with silence */
-    for (size_t i = 0; i < handle->dma_buf_count; i++) {
-        for (size_t f = 0; f < handle->frames_per_buf; f++) {
-            uint8_t *dst = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
-            encode_frame(handle, dst, NULL);
-        }
-        parlio_transmit_config_t tc = { .idle_value = 0 };
-        ESP_RETURN_ON_ERROR(
-            parlio_tx_unit_transmit(handle->parlio_unit, handle->dma_bufs[i],
-                                    handle->dma_buf_bytes * 8, &tc),
-            TAG, "silence transmit failed");
-        xSemaphoreTake(handle->write_sem, 0);
+    /* Pre-fill buf[0] with silence and start loop DMA */
+    for (size_t f = 0; f < handle->frames_per_buf; f++) {
+        uint8_t *dst = handle->dma_bufs[0] + f * handle->frame_buf_bytes;
+        encode_frame(handle, dst, NULL);
     }
+    parlio_transmit_config_t tc = {
+        .idle_value = 0,
+        .flags.loop_transmission = 1,
+    };
+    ESP_RETURN_ON_ERROR(
+        parlio_tx_unit_transmit(handle->parlio_unit, handle->dma_bufs[0],
+                                handle->dma_buf_bytes * 8, &tc),
+        TAG, "initial loop transmit failed");
 
-    ESP_LOGI(TAG, "enabled, Fs=%"PRIu32, handle->sample_rate);
+    handle->write_buf_idx = 1;
+    handle->write_frame_pos = 0;
+    handle->start_time_us = esp_timer_get_time();
+    handle->total_submitted = handle->frames_per_buf;
+
+    ESP_LOGD(TAG, "enabled (loop DMA), Fs=%"PRIu32, handle->sample_rate);
     return ESP_OK;
 }
 
 esp_err_t parlio_audio_tx_disable(parlio_audio_tx_handle_t handle)
 {
     if (!handle || !handle->enabled) return ESP_OK;
-    parlio_tx_unit_wait_all_done(handle->parlio_unit, 500);
+    if (!handle->loop_mode)
+        parlio_tx_unit_wait_all_done(handle->parlio_unit, 500);
     parlio_tx_unit_disable(handle->parlio_unit);
     handle->enabled = false;
     return ESP_OK;
@@ -843,24 +944,34 @@ esp_err_t parlio_audio_tx_write(parlio_audio_tx_handle_t handle,
     size_t written = 0;
 
     while (written < num_frames) {
-        /* Wait for a free buffer BEFORE encoding into it.
-         * This prevents writing to a buffer still in the DMA queue. */
-        if (handle->write_frame_pos == 0) {
-            if (xSemaphoreTake(handle->write_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-                if (frames_written) *frames_written = written;
-                return ESP_ERR_TIMEOUT;
-            }
-        }
-
         uint8_t *dst = handle->dma_bufs[handle->write_buf_idx]
                      + handle->write_frame_pos * handle->frame_buf_bytes;
         encode_frame(handle, dst, &samples[written * spf]);
         handle->write_frame_pos++;
         written++;
 
-        /* Buffer full: submit to DMA and advance */
+        /* Buffer full: pace and submit */
         if (handle->write_frame_pos >= handle->frames_per_buf) {
-            parlio_transmit_config_t tc = { .idle_value = 0 };
+            if (handle->loop_mode) {
+                /* Absolute frame-count timing for loop mode */
+                handle->total_submitted += handle->frames_per_buf;
+                int64_t target_us = handle->start_time_us
+                    + (int64_t)(handle->total_submitted * 1000000ULL / handle->sample_rate);
+                int64_t now = esp_timer_get_time();
+                if (target_us > now)
+                    esp_rom_delay_us((uint32_t)(target_us - now));
+            } else {
+                /* Semaphore-based flow control for one-shot mode */
+                if (xSemaphoreTake(handle->write_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+                    if (frames_written) *frames_written = written;
+                    return ESP_ERR_TIMEOUT;
+                }
+            }
+
+            parlio_transmit_config_t tc = {
+                .idle_value = 0,
+                .flags.loop_transmission = handle->loop_mode ? 1 : 0,
+            };
             esp_err_t ret = parlio_tx_unit_transmit(
                 handle->parlio_unit, handle->dma_bufs[handle->write_buf_idx],
                 handle->dma_buf_bytes * 8, &tc);
