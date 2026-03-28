@@ -10,9 +10,9 @@ Multi-protocol audio transmitter that creatively repurposes the Parallel IO peri
     |   | APLL  |----->|  I2S  |----->| MCLK    |-----> GPIO   |
     |   | (PLL) |      | (clk  |      | output  |   |          |
     |   +-------+      |  only)|      +---------+   |          |
-    |                   +-------+          |         |         |
-    |                                      | wire    |         |
-    |   +----------------------------------|---------+         |
+    |                  +-------+           |        |          |
+    |                                      | wire   |          |
+    |   +----------------------------------|--------+          |
     |   |                                  v                   |
     |   |  +---------+    +--------+   +---------+             |
     |   |  | PARLIO  |<---| MCLK   |<--| ext clk |             |
