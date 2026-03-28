@@ -402,7 +402,11 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
 esp_err_t parlio_i2s_tx_disable(parlio_i2s_tx_handle_t handle)
 {
     if (!handle || !handle->enabled) return ESP_OK;
-    parlio_tx_unit_wait_all_done(handle->parlio_unit, 500);
+    /* In loop mode, DMA never finishes on its own -- just disable directly.
+     * In one-shot mode, wait for pending transfers to complete. */
+    if (!handle->loop_mode) {
+        parlio_tx_unit_wait_all_done(handle->parlio_unit, 500);
+    }
     parlio_tx_unit_disable(handle->parlio_unit);
     handle->enabled = false;
     return ESP_OK;

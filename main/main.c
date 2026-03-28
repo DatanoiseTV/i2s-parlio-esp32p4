@@ -60,6 +60,8 @@ static void audio_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static pcnt_channel_handle_t s_pcnt_chan; /* stored for cleanup */
+
 static pcnt_unit_handle_t setup_pcnt(gpio_num_t bclk_gpio)
 {
     pcnt_unit_config_t unit_cfg = {
@@ -74,9 +76,9 @@ static pcnt_unit_handle_t setup_pcnt(gpio_num_t bclk_gpio)
         .edge_gpio_num  = bclk_gpio,
         .level_gpio_num = -1,
     };
-    pcnt_channel_handle_t chan = NULL;
-    ESP_ERROR_CHECK(pcnt_new_channel(unit, &chan_cfg, &chan));
-    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan,
+    s_pcnt_chan = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(unit, &chan_cfg, &s_pcnt_chan));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(s_pcnt_chan,
         PCNT_CHANNEL_EDGE_ACTION_INCREASE,
         PCNT_CHANNEL_EDGE_ACTION_HOLD));
 
@@ -152,19 +154,29 @@ static void run_test(const char *label, uint32_t sample_rate,
     double sw_fs = ctx.total_frames / dt;
     double err_ppm = (hw_fs - sample_rate) * 1e6 / sample_rate;
 
-    const char *status;
-    if (hw_fs >= sample_rate * 0.9999 && hw_fs <= sample_rate * 1.0001)
-        status = "PASS";
-    else if (hw_fs >= sample_rate * 0.999 && hw_fs <= sample_rate * 1.001)
-        status = "OK";
-    else
-        status = "FAIL";
+    /* ANSI color codes for terminal output */
+    #define C_GREEN  "\033[32m"
+    #define C_YELLOW "\033[33m"
+    #define C_RED    "\033[31m"
+    #define C_RESET  "\033[0m"
 
-    ESP_LOGI(TAG, "    HW: Fs=%.1f Hz (%+.0f ppm)  SW: %.0f Hz  [%s]",
-             hw_fs, err_ppm, sw_fs, status);
+    const char *color, *status;
+    if (hw_fs >= sample_rate * 0.9999 && hw_fs <= sample_rate * 1.0001) {
+        color = C_GREEN; status = "PASS";
+    } else if (hw_fs >= sample_rate * 0.999 && hw_fs <= sample_rate * 1.001) {
+        color = C_YELLOW; status = "OK";
+    } else {
+        color = C_RED; status = "FAIL";
+    }
 
+    printf("    HW: Fs=%.1f Hz (%+.0f ppm)  SW: %.0f Hz  [%s%s%s]\n",
+           hw_fs, err_ppm, sw_fs, color, status, C_RESET);
+
+    /* Clean up PCNT: delete channel first, then unit */
     pcnt_unit_disable(pcnt);
+    pcnt_del_channel(s_pcnt_chan);
     pcnt_del_unit(pcnt);
+
     parlio_i2s_tx_disable(tx);
     parlio_i2s_tx_delete(tx);
     vTaskDelay(pdMS_TO_TICKS(200));
@@ -178,6 +190,9 @@ void app_main(void)
         .flags = { .adjustable = false },
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo4));
+
+    /* Suppress the expected "input clock GPIO is set, use external clk src" warning */
+    esp_log_level_set("parlio", ESP_LOG_ERROR);
 
     ESP_LOGI(TAG, "=== PARLIO I2S Throughput Sweep (PCNT-verified, %ds each) ===", TEST_SECONDS);
     ESP_LOGI(TAG, "  %-22s %5s     %s  %s", "Config", "Fs", "Ch", "BCLK");
