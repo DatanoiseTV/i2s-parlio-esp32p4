@@ -30,7 +30,7 @@ static const char *TAG = "audio_test";
 #define PIN_DATA9      GPIO_NUM_6
 #define PIN_DATA10     GPIO_NUM_53
 
-#define TEST_SECONDS   5
+#define TEST_SECONDS   3
 #define FRAMES_PER_BUF 128
 #define MAX_RESULTS    40
 static int test_num = 0;
@@ -214,7 +214,7 @@ static void run_test(const char *label, uint32_t sample_rate,
     double dt = (t_end - t_start) / 1e6;
 
     ctx.running = false;
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     double hw_bclk = final_count / dt;
     double hw_fs = hw_bclk / (32.0 * num_slots);
@@ -254,7 +254,7 @@ static void run_test(const char *label, uint32_t sample_rate,
     pcnt_del_unit(pcnt);
     parlio_i2s_tx_disable(tx);
     parlio_i2s_tx_delete(tx);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 /* ------------------------------------------------------------------ */
@@ -385,7 +385,7 @@ static void run_unified_test(const char *label, uint32_t sample_rate,
     double dt = (t_end - t_start) / 1e6;
 
     uctx.running = false;
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     /* clk_out = PARLIO clock = ticks_per_frame * Fs.
      * Measured Fs = counted_edges / dt / ticks_per_frame */
@@ -427,7 +427,7 @@ static void run_unified_test(const char *label, uint32_t sample_rate,
     pcnt_del_unit(pcnt);
     parlio_audio_tx_disable(tx);
     parlio_audio_tx_delete(tx);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 static void print_summary(void)
@@ -485,7 +485,7 @@ void app_main(void)
     esp_log_level_set("pcnt", ESP_LOG_ERROR);
 
     /* Count total tests */
-    test_total = 17 + 6 + 5 + 4 + 3 + 6; /* 48k + 96k + 192k + 44.1k + low + unified */
+    test_total = 17 + 6 + 5 + 4 + 3 + 9; /* 48k + 96k + 192k + 44.1k + low + unified */
 
     printf("\n" C_BOLD "========================================" C_RESET "\n");
     printf(C_BOLD "  PARLIO I2S Throughput Sweep" C_RESET "\n");
@@ -593,6 +593,39 @@ void app_main(void)
         };
         parlio_audio_adat_config_t adat_w_4stereo = { .adat_gpio = PIN_DATA7 };
         run_unified_test("ADAT+Stereo4 (16ch)", 48000, &i2s_4x2, &adat_w_4stereo, 512);
+
+        /* ADAT + I2S TDM8 x4 (40 ch) */
+        parlio_audio_i2s_config_t i2s_4x8 = {
+            .mode = PARLIO_AUDIO_I2S_TDM8,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 4,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6 },
+        };
+        parlio_audio_adat_config_t adat_w_tdm8x4 = { .adat_gpio = PIN_DATA7 };
+        run_unified_test("ADAT+TDM8x4 (40ch)", 48000, &i2s_4x8, &adat_w_tdm8x4, 512);
+
+        /* ADAT + I2S TDM4 x7 (36 ch) */
+        parlio_audio_i2s_config_t i2s_7x4 = {
+            .mode = PARLIO_AUDIO_I2S_TDM4,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 7,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6,
+                            PIN_DATA7, PIN_DATA8, PIN_DATA9 },
+        };
+        parlio_audio_adat_config_t adat_w_tdm4x7 = { .adat_gpio = PIN_DATA10 };
+        run_unified_test("ADAT+TDM4x7 (36ch)", 48000, &i2s_7x4, &adat_w_tdm4x7, 512);
+
+        /* ADAT + I2S Stereo x8 (24 ch) */
+        parlio_audio_i2s_config_t i2s_8x2 = {
+            .mode = PARLIO_AUDIO_I2S_STANDARD,
+            .bits_per_sample = 32, .slot_width = 32, .num_data_lines = 8,
+            .bclk_gpio = PIN_DATA1, .lrck_gpio = PIN_DATA2,
+            .data_gpios = { PIN_DATA3, PIN_DATA4, PIN_DATA5, PIN_DATA6,
+                            PIN_DATA7, PIN_DATA8, PIN_DATA9, PIN_DATA10 },
+        };
+        parlio_audio_adat_config_t adat_w_8stereo = { .adat_gpio = PIN_LRCK };
+        /* Note: reuse LRCK pin for ADAT since unified driver assigns its own TXD */
+        run_unified_test("ADAT+Stereo8 (24ch)", 48000, &i2s_8x2, &adat_w_8stereo, 512);
 
         /* ADAT 44.1 kHz (8 ch) */
         parlio_audio_adat_config_t adat_441 = { .adat_gpio = PIN_DATA0 };
