@@ -843,16 +843,9 @@ esp_err_t parlio_audio_tx_write(parlio_audio_tx_handle_t handle,
     size_t written = 0;
 
     while (written < num_frames) {
-        if (handle->write_frame_pos >= handle->frames_per_buf) {
-            parlio_transmit_config_t tc = { .idle_value = 0 };
-            esp_err_t ret = parlio_tx_unit_transmit(
-                handle->parlio_unit, handle->dma_bufs[handle->write_buf_idx],
-                handle->dma_buf_bytes * 8, &tc);
-            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
-
-            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
-            handle->write_frame_pos = 0;
-
+        /* Wait for a free buffer BEFORE encoding into it.
+         * This prevents writing to a buffer still in the DMA queue. */
+        if (handle->write_frame_pos == 0) {
             if (xSemaphoreTake(handle->write_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
                 if (frames_written) *frames_written = written;
                 return ESP_ERR_TIMEOUT;
@@ -864,6 +857,18 @@ esp_err_t parlio_audio_tx_write(parlio_audio_tx_handle_t handle,
         encode_frame(handle, dst, &samples[written * spf]);
         handle->write_frame_pos++;
         written++;
+
+        /* Buffer full: submit to DMA and advance */
+        if (handle->write_frame_pos >= handle->frames_per_buf) {
+            parlio_transmit_config_t tc = { .idle_value = 0 };
+            esp_err_t ret = parlio_tx_unit_transmit(
+                handle->parlio_unit, handle->dma_bufs[handle->write_buf_idx],
+                handle->dma_buf_bytes * 8, &tc);
+            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
+
+            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
+            handle->write_frame_pos = 0;
+        }
     }
 
     if (frames_written) *frames_written = written;

@@ -410,7 +410,7 @@ esp_err_t parlio_i2s_tx_enable(parlio_i2s_tx_handle_t handle)
             uint8_t *frame_ptr = handle->dma_bufs[i] + f * handle->frame_buf_bytes;
             encode_frame(handle, frame_ptr, NULL);
         }
-        parlio_transmit_config_t tx_cfg = { .idle_value = 0, .flags.queue_nonblocking = 1 };
+        parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
         ESP_RETURN_ON_ERROR(
             parlio_tx_unit_transmit(handle->parlio_unit,
                                     handle->dma_bufs[i],
@@ -458,18 +458,9 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
     size_t written = 0;
 
     while (written < num_frames) {
-        if (handle->write_frame_pos >= handle->frames_per_buf) {
-            parlio_transmit_config_t tx_cfg = { .idle_value = 0, .flags.queue_nonblocking = 1 };
-            esp_err_t ret = parlio_tx_unit_transmit(
-                handle->parlio_unit,
-                handle->dma_bufs[handle->write_buf_idx],
-                handle->dma_buf_bytes * 8,
-                &tx_cfg);
-            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
-
-            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
-            handle->write_frame_pos = 0;
-
+        /* Wait for a free buffer BEFORE encoding into it.
+         * This ensures we never write to a buffer that DMA is still reading. */
+        if (handle->write_frame_pos == 0) {
             if (xSemaphoreTake(handle->write_sem,
                                pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
                 if (frames_written) *frames_written = written;
@@ -484,6 +475,20 @@ esp_err_t parlio_i2s_tx_write(parlio_i2s_tx_handle_t handle,
 
         handle->write_frame_pos++;
         written++;
+
+        /* Buffer full: submit to DMA and advance to next buffer */
+        if (handle->write_frame_pos >= handle->frames_per_buf) {
+            parlio_transmit_config_t tx_cfg = { .idle_value = 0 };
+            esp_err_t ret = parlio_tx_unit_transmit(
+                handle->parlio_unit,
+                handle->dma_bufs[handle->write_buf_idx],
+                handle->dma_buf_bytes * 8,
+                &tx_cfg);
+            ESP_RETURN_ON_ERROR(ret, TAG, "transmit failed");
+
+            handle->write_buf_idx = (handle->write_buf_idx + 1) % handle->dma_buf_count;
+            handle->write_frame_pos = 0;
+        }
     }
 
     if (frames_written) *frames_written = written;
