@@ -68,7 +68,8 @@ struct parlio_i2s_tx {
 
 static uint8_t next_parlio_width(uint8_t needed)
 {
-    if (needed <= 1)  return 1;
+    /* Min 8-bit to avoid sub-byte packing in encoder (unused pins cost nothing) */
+    if (needed <= 8)  return 8;
     if (needed <= 2)  return 2;
     if (needed <= 4)  return 4;
     if (needed <= 8)  return 8;
